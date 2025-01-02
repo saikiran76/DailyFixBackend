@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: cmsmatrix-backend
+    runtime: node
+    rootDirectory: backend
+    buildCommand: npm install
+    startCommand: node index.js
