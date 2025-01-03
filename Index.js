@@ -23,6 +23,7 @@ import { initializeSocketServer } from './services/socketService.js';
 import userRoutes from './routes/userRoutes.js';
 import onboardingRoutes from './routes/onboardingRoutes.js';
 import adminRoutes from './routes/adminRoutes.js';
+import reportRoutes from './routes/reportRoutes.js';
 
 
 dotenv.config();
@@ -196,6 +197,7 @@ async function initializeDatabase() {
 // Add routes
 app.use('/auth', authRoutes);
 app.use('/connect', connectRoutes);
+app.use('/reports', reportRoutes)
 app.use('/matrix', matrixRoomRoutes);
 app.use('/accounts', accountRoutes);
 app.use('/platforms', platformRoutes);

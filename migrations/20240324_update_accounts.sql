@@ -1,9 +1,18 @@
+-- Create the run_sql function if it doesn't exist
+CREATE OR REPLACE FUNCTION public.run_sql(query text)
+RETURNS void AS $$
+BEGIN
+  EXECUTE query;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
 -- Add new columns for platform data and credentials
 ALTER TABLE accounts
 ADD COLUMN IF NOT EXISTS platform_data JSONB DEFAULT '{}'::jsonb,
 ADD COLUMN IF NOT EXISTS credentials JSONB DEFAULT '{}'::jsonb,
 ADD COLUMN IF NOT EXISTS platform_user_id TEXT,
-ADD COLUMN IF NOT EXISTS platform_username TEXT;
+ADD COLUMN IF NOT EXISTS platform_username TEXT,
+ADD COLUMN IF NOT EXISTS last_token_refresh TIMESTAMPTZ DEFAULT NOW();
 
 -- Add indexes for performance
 CREATE INDEX IF NOT EXISTS idx_accounts_platform_user_id ON accounts(platform_user_id);

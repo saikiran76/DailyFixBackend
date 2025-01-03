@@ -1,4 +1,4 @@
-import { adminClient } from '../utils/supabase.js';
+import supabase from '../utils/supabase.js';
 
 export const authenticateUser = async (req, res, next) => {
   try {
@@ -14,7 +14,7 @@ export const authenticateUser = async (req, res, next) => {
     const token = authHeader.split(' ')[1];
     
     try {
-      const { data: { user }, error } = await adminClient.auth.getUser(token);
+      const { data: { user }, error } = await supabase.auth.getUser(token);
 
       if (error) {
         console.error('Token validation error:', error);

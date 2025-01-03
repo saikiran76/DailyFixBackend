@@ -1,6 +1,6 @@
 // backend/routes/slackRoutes.js
 import express from 'express';
-import { authenticateToken } from '../middleware/auth.js';
+import { authenticateUser } from '../middleware/auth.js';
 import Message from '../models/Message.js';
 import Account from '../models/Account.js';
 import User from '../models/User.js';
@@ -9,7 +9,7 @@ import { analyzeSentiment, categorizeMessage, calculateMessagePriority } from '.
 import { processSlackEvent, exchangeSlackCodeForToken } from '../services/slackService.js';
 
 const router = express.Router();
-router.use(authenticateToken);
+router.use(authenticateUser);
 
 // Slack event subscription endpoint:
 router.post('/events', async (req,res)=>{

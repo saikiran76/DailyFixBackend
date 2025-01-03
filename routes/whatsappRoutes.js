@@ -1,5 +1,5 @@
 import express from 'express';
-import { authenticateToken } from '../middleware/auth.js';
+import { authenticateUser } from '../middleware/auth.js';
 // import { 
 //   initializeWhatsAppClient, 
 //   getWhatsAppClient 
@@ -9,7 +9,7 @@ import { Message } from '../models/Message.js';
 const router = express.Router();
 
 // Get all WhatsApp conversations
-router.get('/conversations', authenticateToken, async (req, res) => {
+router.get('/conversations', authenticateUser, async (req, res) => {
   try {
     const client = req.app.locals.whatsappClient;
     
@@ -32,7 +32,7 @@ router.get('/conversations', authenticateToken, async (req, res) => {
 });
 
 // Get messages for a specific WhatsApp conversation
-router.get('/conversations/:conversationId/messages', authenticateToken, async (req, res) => {
+router.get('/conversations/:conversationId/messages', authenticateUser, async (req, res) => {
   try {
     const { conversationId } = req.params;
     const { limit = 50 } = req.query;
@@ -63,7 +63,7 @@ router.get('/conversations/:conversationId/messages', authenticateToken, async (
 });
 
 // Send a WhatsApp message
-router.post('/conversations/:conversationId/messages', authenticateToken, async (req, res) => {
+router.post('/conversations/:conversationId/messages', authenticateUser, async (req, res) => {
   try {
     const { conversationId } = req.params;
     const { content, priority } = req.body;
@@ -108,7 +108,7 @@ router.post('/conversations/:conversationId/messages', authenticateToken, async 
 });
 
 // Get WhatsApp conversation summary
-router.get('/conversations/:conversationId/summary', authenticateToken, async (req, res) => {
+router.get('/conversations/:conversationId/summary', authenticateUser, async (req, res) => {
   try {
     const { conversationId } = req.params;
     const client = req.app.locals.whatsappClient;

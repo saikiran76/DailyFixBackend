@@ -2,6 +2,7 @@ import { adminClient } from '../utils/supabase.js';
 import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import fetch from 'node-fetch';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -13,12 +14,21 @@ async function runMigration() {
     const migrationSQL = await fs.readFile(migrationPath, 'utf8');
     console.log('Migration SQL:', migrationSQL);
 
-    // Execute migration
-    const { error } = await adminClient.rpc('run_sql', {
-      query: migrationSQL
+    // Execute migration using Supabase REST API
+    const response = await fetch(`${process.env.SUPABASE_URL}/rest/v1/rpc/run_sql`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'apikey': process.env.SUPABASE_SERVICE_KEY,
+        'Authorization': `Bearer ${process.env.SUPABASE_SERVICE_KEY}`
+      },
+      body: JSON.stringify({
+        query: migrationSQL
+      })
     });
 
-    if (error) {
+    if (!response.ok) {
+      const error = await response.json();
       console.error('Migration error:', error);
       process.exit(1);
     }

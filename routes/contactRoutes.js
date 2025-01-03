@@ -1,9 +1,9 @@
 import express from 'express';
-import { authenticateToken } from '../middleware/auth.js';
+import { authenticateUser } from '../middleware/auth.js';
 import { fetchAllContacts } from '../services/contactService.js';
 
 const router = express.Router();
-router.use(authenticateToken);
+router.use(authenticateUser);
 
 router.get('/', async (req, res) => {
     try {

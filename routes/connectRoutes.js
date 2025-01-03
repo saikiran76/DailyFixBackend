@@ -17,7 +17,8 @@ import {
   getDiscordServers,
   getDiscordChannels,
   getDiscordDirectMessages,
-  getDiscordMessages
+  getDiscordMessages,
+  getDiscordClient
 } from '../services/directServices/discordDirect.js';
 import {
   initializePlatform as initializeConnection,
@@ -25,6 +26,8 @@ import {
   disconnectPlatform as disconnectConnection
 } from '../services/directServices/connectionManager.js';
 import reportService from '../services/reportService.js';
+import { refreshDiscordToken } from '../services/directServices/discordDirect.js';
+import { getChannelMessages } from '../services/discordService.js';
 
 const router = express.Router();
 
@@ -498,7 +501,8 @@ router.get('/discord/servers', authenticateUser, async (req, res) => {
     // Validate servers response
     if (!servers || !servers.data) {
       return res.status(500).json({ 
-        message: 'Invalid response from Discord API'
+        message: 'Invalid response from Discord API',
+        loggedServers: servers
       });
     }
 
@@ -523,8 +527,145 @@ router.get('/discord/servers', authenticateUser, async (req, res) => {
   }
 });
 
+router.get('/discord/servers/:serverId', authenticateUser, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { serverId } = req.params;
+    
+    // Validate user has active Discord connection
+    const { data: account, error: accountError } = await adminClient
+      .from('accounts')
+      .select('status, credentials')
+      .eq('user_id', userId)
+      .eq('platform', 'discord')
+      .single();
+      
+    if (accountError || !account) {
+      return res.status(403).json({
+        status: 'error',
+        message: 'Discord account not found. Please connect your Discord account.'
+      });
+    }
+    
+    if (account.status !== 'active') {
+      return res.status(403).json({
+        status: 'error',
+        message: 'Discord account is not active. Please reconnect your Discord account.'
+      });
+    }
+
+    if (!account?.credentials?.access_token) {  
+      return res.status(403).json({  
+        status: 'error',  
+        message: 'No Discord access token found.'  
+      });  
+    }  
+
+    const tokenExpiration = account.credentials.expires_at;  
+    const currentTime = new Date().getTime() / 1000;  
+    if (tokenExpiration - currentTime < 60) {  
+      await refreshDiscordToken(userId);  
+    }  
+
+    const response = await fetch(`https://discord.com/api/v10/guilds/${serverId}`, {  
+      headers: {  
+        Authorization: `Bearer ${account.credentials.access_token}`  
+      }  
+    });
+
+    if (!response.ok) {  
+      if (response.status === 401) {  
+        // Token has expired, refresh and retry  
+        await refreshDiscordToken(userId);  
+        return res.redirect(`/discord/servers/${serverId}`);  
+      }  
+      if (response.status === 403) {  
+        return res.status(403).json({  
+          status: 'error',  
+          message: 'Bot does not have access to this server. Please reinvite the bot with proper permissions.'  
+        });  
+      }  
+      throw new Error(`Failed to fetch Discord server: ${response.status}`);  
+    }  
+
+    const guild = await response.json();  
+
+    // Return with consistent response format  
+    return res.json({  
+      status: 'success',  
+      data: {  
+        id: guild.id,  
+        name: guild.name,  
+        icon: guild.icon,  
+        approximate_member_count: guild.approximate_member_count,  
+        description: guild.description,  
+        features: guild.features  
+      },  
+      meta: {  
+        hasMore: false  
+      }  
+    });  
+
+    // if (!account?.credentials?.access_token) {
+    //   return res.status(403).json({
+    //     status: 'error',
+    //     message: 'No Discord access token found.'
+    //   });
+    // }
+
+    // // Get server details using Discord REST API
+    // const response = await fetch(`https://discord.com/api/v10/guilds/${serverId}`, {
+    //   headers: {
+    //     Authorization: `Bearer ${account.credentials.access_token}`
+    //   }
+    // });
+
+    // if (!response.ok) {
+    //   if (response.status === 401) {
+    //     return res.status(401).json({
+    //       status: 'error',
+    //       message: 'Discord token expired. Please reconnect.'
+    //     });
+    //   }
+    //   if (response.status === 403) {
+    //     return res.status(403).json({
+    //       status: 'error',
+    //       message: 'Bot does not have access to this server. Please reinvite the bot with proper permissions.'
+    //     });
+    //   }
+    //   throw new Error(`Failed to fetch Discord server: ${response.status}`);
+    // }
+
+    // const guild = await response.json();
+
+    // // Return with consistent response format
+    // return res.json({
+    //   status: 'success',
+    //   data: {
+    //     id: guild.id,
+    //     name: guild.name,
+    //     icon: guild.icon,
+    //     approximate_member_count: guild.approximate_member_count,
+    //     description: guild.description,
+    //     features: guild.features
+    //   },
+    //   meta: {
+    //     hasMore: false
+    //   }
+    // });
+  } catch (error) {
+    console.error('Error fetching Discord server:', error);
+    return res.status(500).json({ 
+      status: 'error',
+      message: 'Failed to fetch server details',
+      details: process.env.NODE_ENV === 'development' ? error.toString() : undefined
+    });
+  }
+});
+
 router.get('/discord/servers/:serverId/channels', authenticateUser, async (req, res) => {
   try {
+    console.log("Request test!!!")
     const userId = req.user.id;
     const { serverId } = req.params;
     
@@ -551,14 +692,15 @@ router.get('/discord/servers/:serverId/channels', authenticateUser, async (req, 
     const channels = await getDiscordChannels(userId, serverId);
     
     // Validate channels response
-    if (!channels || !Array.isArray(channels)) {
+    if (!channels || !Array.isArray(channels.data)) {
       return res.status(500).json({ 
-        message: 'Invalid response from Discord API'
+        message: 'Invalid response from Discord API',
+        loggedChannels: channels
       });
     }
     
     // Filter and validate channel objects
-    const validatedChannels = channels
+    const validatedChannels = channels.data
       .filter(channel => channel && channel.id)
       .map(channel => ({
         id: channel.id,
@@ -737,83 +879,6 @@ router.get('/discord/channels/:channelId/messages', authenticateUser, async (req
 });
 
 // Add report-related routes
-router.get('/discord/servers/:serverId', authenticateUser, async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const { serverId } = req.params;
-    
-    // Validate user has active Discord connection
-    const { data: account, error: accountError } = await adminClient
-      .from('accounts')
-      .select('status, credentials')
-      .eq('user_id', userId)
-      .eq('platform', 'discord')
-      .single();
-      
-    if (accountError || !account) {
-      return res.status(403).json({
-        status: 'error',
-        message: 'Discord account not found. Please connect your Discord account.'
-      });
-    }
-    
-    if (account.status !== 'active') {
-      return res.status(403).json({
-        status: 'error',
-        message: 'Discord account is not active. Please reconnect your Discord account.'
-      });
-    }
-
-    // Get server details using Discord.js client
-    const client = await getDiscordClient(userId);
-    if (!client || !client.isReady()) {
-      return res.status(500).json({
-        status: 'error',
-        message: 'Discord connection not ready. Please try again.'
-      });
-    }
-
-    const guild = await client.guilds.fetch(serverId);
-    if (!guild) {
-      return res.status(404).json({
-        status: 'error',
-        message: 'Server not found'
-      });
-    }
-
-    // Return with consistent response format
-    return res.json({
-      status: 'success',
-      data: {
-        id: guild.id,
-        name: guild.name,
-        icon: guild.icon,
-        approximate_member_count: guild.approximateMemberCount,
-        description: guild.description,
-        features: guild.features
-      },
-      meta: {
-        hasMore: false
-      }
-    });
-  } catch (error) {
-    console.error('Error fetching Discord server:', error);
-    
-    if (error.code === 50001) {
-      return res.status(403).json({
-        status: 'error',
-        message: 'Bot does not have access to this server. Please reinvite the bot with proper permissions.'
-      });
-    }
-    
-    return res.status(500).json({ 
-      status: 'error',
-      message: 'Failed to fetch server details',
-      details: process.env.NODE_ENV === 'development' ? error.toString() : undefined
-    });
-  }
-});
-
 router.post('/discord/servers/:serverId/report', authenticateUser, async (req, res) => {
   try {
     const { serverId } = req.params;
@@ -937,6 +1002,51 @@ router.post('/discord/verify-state', authenticateUser, async (req, res) => {
     return res.status(500).json({ 
       status: 'error',
       message: 'Failed to verify Discord state: ' + error.message
+    });
+  }
+});
+
+// Get today's messages for a channel
+router.get('/discord/channels/:channelId/messages/today', authenticateUser, async (req, res) => {
+  try {
+    const { channelId } = req.params;
+    const userId = req.user.id;
+
+    // Validate user has active Discord connection
+    const { data: account, error: accountError } = await adminClient
+      .from('accounts')
+      .select('status')
+      .eq('user_id', userId)
+      .eq('platform', 'discord')
+      .single();
+
+    if (accountError || !account) {
+      return res.status(403).json({
+        status: 'error',
+        message: 'Discord account not found. Please connect your Discord account.'
+      });
+    }
+
+    if (account.status !== 'active') {
+      return res.status(403).json({
+        status: 'error',
+        message: 'Discord account is not active. Please reconnect your Discord account.'
+      });
+    }
+
+    // Get messages using the service
+    const messages = await getChannelMessages(channelId);
+
+    res.json({
+      status: 'success',
+      data: messages
+    });
+  } catch (error) {
+    console.error('Error fetching channel messages:', error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to fetch channel messages',
+      error: error.message
     });
   }
 });
