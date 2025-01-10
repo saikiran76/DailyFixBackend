@@ -2,6 +2,8 @@ import express from 'express';
 import jwt from 'jsonwebtoken';
 import User from '../models/User.js';
 import bcrypt from 'bcryptjs';
+import authMiddleware from '../middleware/authMiddleware.js';
+import { adminClient } from '../utils/supabase.js';
 
 const router = express.Router();
 
@@ -120,6 +122,43 @@ router.get('/verify', async (req, res) => {
     });
   } catch (error) {
     res.status(401).json({ error: 'Invalid token' });
+  }
+});
+
+// GET SESSION
+router.get('/session', authMiddleware, async (req, res) => {
+  try {
+    const user = req.user;
+    const authType = req.authType;
+
+    if (!user) {
+      return res.status(401).json({ error: 'No active session' });
+    }
+
+    // Get the token from the request header
+    const token = req.headers.authorization?.split(' ')[1];
+
+    // If using JWT, get a Supabase token for socket auth
+    let socketToken = token;
+    if (authType === 'jwt') {
+      const { data: { session }, error } = await adminClient.auth.admin.createSession({
+        userId: user.id
+      });
+      
+      if (error) throw error;
+      socketToken = session.access_token;
+    }
+
+    res.json({
+      token: socketToken,
+      userId: user.id,
+      email: user.email,
+      authType,
+      lastActivity: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('Session fetch error:', error);
+    res.status(500).json({ error: 'Failed to fetch session information' });
   }
 });
 

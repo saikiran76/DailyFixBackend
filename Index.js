@@ -6,6 +6,7 @@ import cookieParser from 'cookie-parser';
 import session from 'express-session';
 import { Server } from 'socket.io';
 import dotenv from 'dotenv';
+import { setIO } from './utils/socket.js';
 
 import { initializeMatrixClient } from './services/matrixService.js';
 import { initializePlatformBridge } from './services/matrixBridgeService.js';
@@ -24,7 +25,8 @@ import userRoutes from './routes/userRoutes.js';
 import onboardingRoutes from './routes/onboardingRoutes.js';
 import adminRoutes from './routes/adminRoutes.js';
 import reportRoutes from './routes/reportRoutes.js';
-
+import matrixRoutes from './routes/matrixRoutes.js';
+import whatsappEntityRoutes from './routes/whatsappEntityRoutes.js';
 
 dotenv.config();
 
@@ -74,8 +76,9 @@ const server = http.createServer(app);
 // Initialize socket.io with the server
 const io = initializeSocketServer(server);
 
-// Make io available to routes
+// Make io available to routes and set in socket utility
 app.set('io', io);
+setIO(io);
 
 // Initialize Matrix clients and bridges
 async function initializeServices() {
@@ -197,14 +200,15 @@ async function initializeDatabase() {
 // Add routes
 app.use('/auth', authRoutes);
 app.use('/connect', connectRoutes);
-app.use('/reports', reportRoutes)
-app.use('/matrix', matrixRoomRoutes);
+app.use('/reports', reportRoutes);
+app.use('/matrix', matrixRoutes);
 app.use('/accounts', accountRoutes);
 app.use('/platforms', platformRoutes);
 app.use('/bridge', bridgeRoutes);
 app.use('/user', userRoutes);
 app.use('/onboarding', onboardingRoutes);
 app.use('/admin', adminRoutes);
+app.use('/api/whatsapp-entities', whatsappEntityRoutes);
 app.use(errorHandler);
 
 // Start server only after database is initialized
