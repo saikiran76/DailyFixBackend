@@ -5,339 +5,363 @@ import * as sdk from 'matrix-js-sdk';
 import { getIO } from '../utils/socket.js';
 
 // Helper function to extract WhatsApp ID from room data
-function extractWhatsAppId(roomData) {
-  try {
-    // Check room name for phone numbers
-    const phoneRegex = /\+\d{10,}/;
-    const nameMatch = roomData.name?.match(phoneRegex);
-    if (nameMatch) {
-      return nameMatch[0];
-    }
+// function extractWhatsAppId(roomData) {
+//   try {
+//     // For groups, use the room name as identifier
+//     if (roomData.is_group) {
+//       return roomData.name?.replace(' (WA)', '').trim() || null;
+//     }
 
-    // Check bridge state events
-    const bridgeEvent = roomData.state_events?.[0]?.getContent();
-    if (bridgeEvent?.remote_id) {
-      return bridgeEvent.remote_id;
-    }
+//     // Check bridge state events first as they're most reliable
+//     const bridgeEvent = roomData.state_events?.[0]?.getContent();
+//     if (bridgeEvent?.remote_id) {
+//       return bridgeEvent.remote_id;
+//     }
 
-    // Check room topic
-    const topicMatch = roomData.topic?.match(phoneRegex);
-    if (topicMatch) {
-      return topicMatch[0];
-    }
+//     // Check room name for phone numbers
+//     const phoneRegex = /\+\d{10,}/;
+//     const nameMatch = roomData.name?.match(phoneRegex);
+//     if (nameMatch) {
+//       return nameMatch[0];
+//     }
 
-    // For personal chats, try extracting from name with (WA) suffix
-    if (roomData.name?.endsWith('(WA)')) {
-      const cleanName = roomData.name.replace('(WA)', '').trim();
-      // Only use if it looks like a contact name
-      if (!cleanName.includes(' ') && cleanName.length > 0) {
-        return cleanName;
-      }
-    }
+//     // Check room topic
+//     const topicMatch = roomData.topic?.match(phoneRegex);
+//     if (topicMatch) {
+//       return topicMatch[0];
+//     }
 
-    return null;
-  } catch (error) {
-    console.error('Error extracting WhatsApp ID:', error);
-    return null;
-  }
-}
+//     // For personal chats with (WA) suffix
+//     if (roomData.name?.endsWith('(WA)')) {
+//       const cleanName = roomData.name.replace('(WA)', '').trim();
+//       // Only use if it looks like a contact name or number
+//       if (cleanName.length > 0) {
+//         return cleanName;
+//       }
+//     }
+
+//     return null;
+//   } catch (error) {
+//     console.error('Error extracting WhatsApp ID:', error);
+//     return null;
+//   }
+// }
 
 class WhatsAppEntityService {
-  async getContacts(userId) {
+  constructor() {
+    this.whatsappRooms = [];
+    this.skippedRooms = [];
+    this.failedContacts = [];
+    this.extractWhatsAppId = this.extractWhatsAppId.bind(this);
+  }
+
+  extractWhatsAppId(roomData) {
     try {
-      // Step 1: Check WhatsApp account status from accounts table
-      const { data: whatsappAccount, error: accountError } = await adminClient
-        .from('accounts')
-        .select('status, credentials, metadata')
-        .eq('user_id', userId)
-        .eq('platform', 'whatsapp')
-        .single();
-
-      if (accountError) {
-        console.error('WhatsApp account fetch error:', accountError);
-        throw new Error('Failed to fetch WhatsApp account status');
-      }
-      if (!whatsappAccount) {
-        return { status: 'error', message: 'WhatsApp account not found' };
-      }
-      if (whatsappAccount.status !== 'active') {
-        return { 
-          status: 'error', 
-          message: 'WhatsApp connection is not active',
-          details: {
-            current_status: whatsappAccount.status,
-            last_active: whatsappAccount.metadata?.last_active,
-            reason: whatsappAccount.metadata?.inactive_reason
-          }
-        };
-      }
-
-      // Step 2: Get Matrix account with enhanced validation
-      const { data: matrixAccount, error: matrixError } = await adminClient
-        .from('accounts')
-        .select('credentials, metadata')
-        .eq('user_id', userId)
-        .eq('platform', 'matrix')
-        .eq('status', 'active')
-        .single();
-
-      if (matrixError) {
-        console.error('Matrix account fetch error:', matrixError);
-        throw new Error('Failed to fetch Matrix account status');
-      }
+      // First try bridge state events as they're most reliable
+      const bridgeEvent = roomData.state_events?.find(event => 
+        event.type === 'uk.half-shot.bridge' && 
+        event.content?.bridge === 'whatsapp'
+      );
       
-      if (!matrixAccount?.credentials) {
-        return { 
-          status: 'error', 
-          message: 'No active Matrix account found',
-          details: {
-            reason: matrixError ? 'fetch_error' : 'missing_credentials'
-          }
-        };
+      if (bridgeEvent?.content?.remote?.id) {
+        console.log(`[WhatsApp ID] Found from bridge event: ${bridgeEvent.content.remote.id}`);
+        return bridgeEvent.content.remote.id;
       }
 
-      // Step 3: Initialize Matrix client if needed
-      let matrixClient = matrixWhatsAppService.getMatrixClient(userId);
-      if (!matrixClient) {
-        try {
-          // Get Matrix account from database
-          const { data: matrixAccount, error: accountError } = await adminClient
-            .from('accounts')
-            .select('credentials')
-            .eq('user_id', userId)
-            .eq('platform', 'matrix')
-            .single();
-
-          if (accountError || !matrixAccount) {
-            throw new Error('Matrix account not found');
+      // For groups, try multiple approaches
+      if (roomData.is_group) {
+        // Try room name first
+        if (roomData.name) {
+          const groupName = roomData.name.replace(' (WA)', '').trim();
+          if (groupName) {
+            console.log(`[WhatsApp ID] Found from group name: ${groupName}`);
+            return groupName.replace(/\s+/g, '_').toLowerCase();
           }
-
-          // Create Matrix client with correct credentials
-          matrixClient = sdk.createClient({
-            baseUrl: matrixAccount.credentials.homeserver,
-            accessToken: matrixAccount.credentials.accessToken,
-            userId: matrixAccount.credentials.userId,
-            timeoutMs: 30000,
-            useAuthorizationHeader: true
-          });
-
-          // Store in service
-          matrixWhatsAppService.matrixClients.set(userId, matrixClient);
-        } catch (initError) {
-          console.error('Matrix client initialization error:', initError);
-          return { status: 'error', message: 'Failed to initialize Matrix client: ' + initError.message };
+        }
+        
+        // Try topic as fallback for groups
+        if (roomData.topic) {
+          console.log(`[WhatsApp ID] Found from group topic: ${roomData.topic}`);
+          return roomData.topic.replace(/\s+/g, '_').toLowerCase();
         }
       }
+
+      // For personal chats, try multiple approaches
+      // 1. Try phone number in name or topic
+      const phoneRegex = /\+?[\d\s-]{10,}/;
+      const nameMatch = roomData.name?.match(phoneRegex);
+      const topicMatch = roomData.topic?.match(phoneRegex);
+      
+      if (nameMatch) {
+        const phone = nameMatch[0].replace(/[\s-]/g, '');
+        console.log(`[WhatsApp ID] Found phone from name: ${phone}`);
+        return phone;
+      }
+      
+      if (topicMatch) {
+        const phone = topicMatch[0].replace(/[\s-]/g, '');
+        console.log(`[WhatsApp ID] Found phone from topic: ${phone}`);
+        return phone;
+      }
+
+      // 2. Try (WA) suffix format
+      if (roomData.name?.endsWith('(WA)')) {
+        const cleanName = roomData.name.slice(0, -4).trim();
+        if (cleanName) {
+          console.log(`[WhatsApp ID] Found from WA suffix: ${cleanName}`);
+          return cleanName;
+        }
+      }
+
+      // 3. Last resort - use sanitized room name if nothing else works
+      if (roomData.name) {
+        const sanitizedName = roomData.name
+          .replace(/[^\w\s-]/g, '') // Remove special chars
+          .trim()
+          .replace(/\s+/g, '_')
+          .toLowerCase();
+          
+        if (sanitizedName) {
+          console.log(`[WhatsApp ID] Using sanitized room name as fallback: ${sanitizedName}`);
+          return sanitizedName;
+        }
+      }
+
+      console.log(`[WhatsApp ID] Failed to extract ID for room: ${roomData.roomId}`);
+      return null;
+    } catch (error) {
+      console.error('[WhatsApp ID] Error extracting WhatsApp ID:', error);
+      return null;
+    }
+  }
+
+  async getMatrixClient(userId) {
+    try {
+      // First check if we already have an initialized client
+      let matrixClient = matrixWhatsAppService.getMatrixClient(userId);
+      if (matrixClient) {
+        return matrixClient;
+      }
+
+      // Get Matrix account from database
+      const { data: matrixAccount, error: accountError } = await adminClient
+        .from('accounts')
+        .select('credentials')
+        .eq('user_id', userId)
+        .eq('platform', 'matrix')
+        .single();
+
+      if (accountError || !matrixAccount) {
+        console.error('Matrix account fetch error:', accountError);
+        return null;
+      }
+
+      // Create Matrix client with correct credentials
+      matrixClient = sdk.createClient({
+        baseUrl: matrixAccount.credentials.homeserver,
+        accessToken: matrixAccount.credentials.accessToken,
+        userId: matrixAccount.credentials.userId,
+        timeoutMs: 30000,
+        useAuthorizationHeader: true
+      });
+
+      // Store in service
+      matrixWhatsAppService.matrixClients.set(userId, matrixClient);
 
       // Start client if not running
       if (!matrixClient.clientRunning) {
-        try {
-          console.log('Starting Matrix client...');
-          await matrixClient.startClient();
+        console.log('Starting Matrix client...');
+        await matrixClient.startClient();
+        
+        // Wait for initial sync
+        await new Promise((resolve, reject) => {
+          const timeout = setTimeout(() => reject(new Error('Initial sync timeout')), 30000);
           
-          // Wait for initial sync
-          await new Promise((resolve, reject) => {
-            const timeout = setTimeout(() => reject(new Error('Initial sync timeout')), 30000);
-            
-            const checkSync = () => {
+          const checkSync = () => {
             if (matrixClient.isInitialSyncComplete()) {
               clearTimeout(timeout);
               resolve();
-                return;
-              }
-              setTimeout(checkSync, 1000);
-            };
+              return;
+            }
+            setTimeout(checkSync, 1000);
+          };
 
-              matrixClient.once('sync', (state) => {
-              if (state === 'PREPARED') {
-                clearTimeout(timeout);
-                  resolve();
-              } else if (state === 'ERROR') {
-                clearTimeout(timeout);
-                reject(new Error('Sync failed'));
-              }
-            });
-
-            checkSync();
+          matrixClient.once('sync', (state) => {
+            if (state === 'PREPARED') {
+              clearTimeout(timeout);
+              resolve();
+            } else if (state === 'ERROR') {
+              clearTimeout(timeout);
+              reject(new Error('Sync failed with state: ' + state));
+            }
           });
-        } catch (startError) {
-          console.error('Failed to start Matrix client:', startError);
-          return { status: 'error', message: 'Failed to sync Matrix client: ' + startError.message };
-        }
+
+          checkSync();
+        });
       }
 
-      // Step 4: Get rooms and process WhatsApp contacts
-      console.log('Getting rooms...');
+      return matrixClient;
+    } catch (error) {
+      console.error('Error getting Matrix client:', error);
+      return null;
+    }
+  }
+
+  async getContacts(userId) {
+    try {
+      // Initialize tracking variables
+      const whatsappRooms = [];
+      const skippedRooms = [];
+      const savedContacts = [];
+      const updatedContacts = [];
+      const failedContacts = [];
+
+      // Get Matrix client
+      const matrixClient = await this.getMatrixClient(userId);
+      if (!matrixClient) {
+        throw new Error('Matrix client not initialized');
+      }
+
+      // Get all rooms
       const rooms = matrixClient.getRooms();
-      console.log(`Found ${rooms.length} total rooms`);
-      
-        const whatsappRooms = new Map();
-        const skippedRooms = [];
-        const savedContacts = [];
-        const updatedContacts = [];
-        const failedContacts = [];
+      console.log(`[Contacts] Found ${rooms.length} total rooms`);
 
         // Process each room
-        for (const room of rooms) {
+      for (const [index, room] of rooms.entries()) {
           try {
-            // Check if room has the bridge bot
-            const bridgeBot = room.getMember(BRIDGE_CONFIGS.whatsapp.bridgeBot);
-            if (!bridgeBot || bridgeBot.membership !== 'join') {
-              skippedRooms.push({ roomId: room.roomId, reason: 'no_bridge_bot' });
+          // Check if room has bridge bot
+          const bridgeBot = room.currentState.getMember(BRIDGE_CONFIGS.whatsapp.bridgeBot);
+            if (!bridgeBot || !['join', 'invite'].includes(bridgeBot.membership)) {
+            skippedRooms.push({
+              roomId: room.roomId,
+              reason: 'no_bridge_bot'
+            });
               continue;
             }
 
+          // Auto-join if invited
+          if (bridgeBot.membership === 'invite') {
+            console.log(`[Contacts] Auto-joining room ${room.roomId}`);
+            try {
+            await matrixClient.joinRoom(room.roomId);
+            } catch (joinError) {
+              console.error(`[Contacts] Failed to join room ${room.roomId}:`, joinError);
+              // Continue processing even if join fails
+            }
+          }
+
+          // Get room data with enhanced group detection
+          const allMembers = room.getJoinedMembers();
+          const relevantMembers = allMembers.filter(member => 
+            member.userId !== matrixClient.getUserId() && 
+            member.userId !== BRIDGE_CONFIGS.whatsapp.bridgeBot &&
+            !member.userId.includes('whatsapp-bridge') // Exclude any bridge-related users
+          );
+
             const roomData = {
-              id: room.roomId,
+            roomId: room.roomId,
               name: room.name,
               topic: room.currentState.getStateEvents('m.room.topic', '')[0]?.getContent().topic,
-              type: room.getMyMembership(),
-              members: room.getJoinedMembers().map(m => ({
-                userId: m.userId,
-                displayName: m.name,
-                membership: m.membership
-              })),
-              bridgeBot: {
-                userId: bridgeBot.userId,
-                displayName: bridgeBot.name
-              }
-            };
+            state_events: room.currentState.getStateEvents('uk.half-shot.bridge'),
+            members: relevantMembers,
+            is_group: relevantMembers.length > 1 || room.name?.toLowerCase().includes('group')
+          };
 
-            whatsappRooms.set(room.roomId, roomData);
-          } catch (error) {
-            console.error(`Error processing room ${room.roomId}:`, error);
-            skippedRooms.push({ roomId: room.roomId, reason: 'processing_error', error: error.message });
-          }
-        }
-
-        console.log(`Found ${whatsappRooms.size} WhatsApp rooms (${skippedRooms.length} skipped)`);
-
-      // Process contacts from rooms
-      for (const [roomId, roomData] of whatsappRooms.entries()) {
-        try {
-          const whatsappId = extractWhatsAppId(roomData);
+          // Extract WhatsApp ID with enhanced logging
+          const whatsappId = this.extractWhatsAppId(roomData);
           if (!whatsappId) {
-            console.warn(`Could not extract WhatsApp ID for room ${roomId}`);
-            failedContacts.push({ roomId, reason: 'no_whatsapp_id' });
+            failedContacts.push({
+              roomId: room.roomId,
+              error: 'Failed to extract WhatsApp ID',
+              roomData: {
+                name: roomData.name,
+                topic: roomData.topic,
+                memberCount: relevantMembers.length
+              }
+            });
             continue;
           }
 
-          // Check if contact exists - without using single()
-          const { data: existingContacts, error: fetchError } = await adminClient
-            .from('whatsapp_contacts')
-            .select('id, sync_status, metadata')
-            .eq('user_id', userId)
-            .eq('whatsapp_id', whatsappId);
-
-          if (fetchError) {
-            console.error(`Error checking existing contact for room ${roomId}:`, fetchError);
-            failedContacts.push({ roomId, reason: 'fetch_error', error: fetchError.message });
-            continue;
-          }
-
-          const existingContact = existingContacts?.[0]; // Get first match if any
-
+          // Create contact data
           const contactData = {
             user_id: userId,
             whatsapp_id: whatsappId,
-            display_name: roomData.name || `WhatsApp ${whatsappId}`,
-            bridge_room_id: roomId,
-            sync_status: roomData.type === 'join' ? 'approved' : 'pending',
-            is_group: roomData.members.length > 2,
+            display_name: room.name,
+            sync_status: bridgeBot.membership === 'join' ? 'approved' : 'pending',
+            is_group: roomData.is_group,
             unread_count: 0,
             metadata: {
-              room_name: roomData.name,
-              room_topic: roomData.topic,
-              room_type: roomData.type,
-              members: roomData.members,
-              bridge_bot: roomData.bridgeBot,
-              updated_at: new Date().toISOString()
-            },
-            created_at: new Date().toISOString(),
-            updated_at: new Date().toISOString()
+              room_id: room.roomId,
+              room_type: bridgeBot.membership,
+              member_count: relevantMembers.length
+            }
           };
 
-          // Validate contact data
-          const validationErrors = [];
-          if (!contactData.user_id) validationErrors.push('missing_user_id');
-          if (!contactData.whatsapp_id) validationErrors.push('missing_whatsapp_id');
-          if (!contactData.bridge_room_id) validationErrors.push('missing_bridge_room_id');
-          if (!['pending', 'approved', 'rejected'].includes(contactData.sync_status)) {
-            validationErrors.push('invalid_sync_status');
-          }
-
-          if (validationErrors.length > 0) {
-            console.error(`Invalid contact data for room ${roomId}:`, validationErrors);
-            failedContacts.push({ 
-              roomId, 
-              reason: 'validation_error', 
-              errors: validationErrors 
-            });
-            continue;
-          }
-
-          // Perform upsert
-          const { data, error } = await adminClient
+          // Save or update contact
+          const { data: existingContact } = await adminClient
             .from('whatsapp_contacts')
-            .upsert(contactData, {
-              onConflict: 'user_id,whatsapp_id',
-              returning: true
+            .select('id')
+            .eq('user_id', userId)
+            .eq('whatsapp_id', whatsappId)
+            .maybeSingle();
+
+          if (existingContact) {
+            const { error: updateError } = await adminClient
+              .from('whatsapp_contacts')
+              .update(contactData)
+              .eq('id', existingContact.id);
+
+            if (updateError) {
+            failedContacts.push({ 
+                roomId: room.roomId,
+                error: `Failed to update contact: ${updateError.message}`
             });
-
-          if (error) {
-            console.error(`Failed to save contact for room ${roomId}:`, error);
-            failedContacts.push({ roomId, reason: 'db_error', error: error.message });
-          } else if (existingContact) {
-            updatedContacts.push(data);
-          } else {
-            savedContacts.push(data);
-            console.log(`Created new contact for room ${roomId}: ${whatsappId}`);
-            }
-          } catch (error) {
-          console.error(`Error processing contact for room ${roomId}:`, error);
-          failedContacts.push({ roomId, reason: 'processing_error', error: error.message });
+            } else {
+              updatedContacts.push(contactData);
           }
-      }
+          } else {
+            const { error: insertError } = await adminClient
+            .from('whatsapp_contacts')
+              .insert(contactData);
 
-      // Return contacts from database
-      const { data: contacts, error } = await adminClient
-        .from('whatsapp_contacts')
-        .select(`
-          id,
-          whatsapp_id,
-          display_name,
-          profile_photo_url,
-          sync_status,
-          is_group,
-          last_message_at,
-          unread_count,
-          metadata,
-          bridge_room_id
-        `)
-        .eq('user_id', userId)
-        .order('last_message_at', { ascending: false });
+            if (insertError) {
+              failedContacts.push({
+                roomId: room.roomId,
+                error: `Failed to save contact: ${insertError.message}`
+              });
+          } else {
+              savedContacts.push(contactData);
+            }
+          }
 
-      if (error) {
-        console.error('Database error fetching WhatsApp contacts:', error);
-        return { status: 'error', message: 'Failed to fetch WhatsApp contacts: ' + error.message };
+          whatsappRooms.push(roomData);
+        } catch (roomError) {
+          console.error(`Error processing room ${room.roomId}:`, roomError);
+          failedContacts.push({
+            roomId: room.roomId,
+            error: roomError.message
+          });
+        }
       }
 
       return {
         status: 'success',
-        data: contacts || [],
-        sync_status: {
-          rooms_found: whatsappRooms.size,
-          rooms_skipped: skippedRooms.length,
-          contacts_new: savedContacts.length,
-          contacts_updated: updatedContacts.length,
-          contacts_failed: failedContacts.length
+        data: {
+          rooms_found: rooms.length,
+          whatsapp_rooms: whatsappRooms.length,
+          skipped_rooms: skippedRooms.length,
+          saved_contacts: savedContacts.length,
+          updated_contacts: updatedContacts.length,
+          failed_contacts: failedContacts.length,
+          contacts: [...savedContacts, ...updatedContacts],
+          errors: failedContacts
         }
       };
-    } catch (error) {
-      console.error('Error in WhatsApp contacts verification process:', error);
-      return {
-        status: 'error',
-        message: error.message || 'Failed to verify WhatsApp connection'
+        } catch (error) {
+      console.error('Error getting contacts:', error);
+          return {
+            status: 'error',
+        message: error.message
       };
     }
   }
@@ -485,7 +509,7 @@ class WhatsAppEntityService {
           try {
             // Check if room has the bridge bot
             const bridgeBot = room.getMember(BRIDGE_CONFIGS.whatsapp.bridgeBot);
-            if (!bridgeBot || bridgeBot.membership !== 'join') {
+            if (!bridgeBot || !['join', 'invite'].includes(bridgeBot.membership)) {
               skippedRooms.push({ roomId: room.roomId, reason: 'no_bridge_bot' });
               continue;
             }
@@ -495,6 +519,15 @@ class WhatsAppEntityService {
               name: room.name,
               topic: room.currentState.getStateEvents('m.room.topic', '')[0]?.getContent().topic,
               type: room.getMyMembership(),
+              // Refined group detection logic
+              is_group: (() => {
+                const allMembers = room.getJoinedMembers();
+                const relevantMembers = allMembers.filter(member => 
+                  member.userId !== matrixClient.getUserId() && // Exclude the user themselves
+                  member.userId !== BRIDGE_CONFIGS.whatsapp.bridgeBot // Exclude the WhatsApp bridge bot
+                );
+                return relevantMembers.length > 1; // More than 1 remaining member = group
+              })(),
               members: room.getJoinedMembers().map(m => ({
                 userId: m.userId,
                 displayName: m.name,
@@ -503,7 +536,8 @@ class WhatsAppEntityService {
               bridgeBot: {
                 userId: bridgeBot.userId,
                 displayName: bridgeBot.name
-              }
+              },
+              state_events: room.currentState.getStateEvents('uk.half-shot.bridge')
             };
 
             whatsappRooms.set(room.roomId, roomData);
