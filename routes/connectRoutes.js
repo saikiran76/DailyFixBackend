@@ -20,7 +20,7 @@ router.post('/:platform/initialize', async (req, res) => {
     res.json(result);
   } catch (error) {
     console.error('Connection initialization error:', error);
-    res.status(500).json({
+    res.status(500).json({ 
       status: 'error',
       message: error.message
     });
@@ -30,7 +30,7 @@ router.post('/:platform/initialize', async (req, res) => {
 // Check connection status
 router.get('/:platform/status', async (req, res) => {
   try {
-    const { platform } = req.params;
+  const { platform } = req.params;
     const userId = req.user.id;
 
     const result = await connectionManager.checkConnection(userId, platform);
@@ -40,7 +40,7 @@ router.get('/:platform/status', async (req, res) => {
     });
   } catch (error) {
     console.error('Connection status check error:', error);
-    res.status(500).json({
+    res.status(500).json({ 
       status: 'error',
       message: error.message
     });
@@ -57,7 +57,7 @@ router.post('/:platform/disconnect', async (req, res) => {
     res.json(result);
   } catch (error) {
     console.error('Disconnect error:', error);
-    res.status(500).json({
+    res.status(500).json({ 
       status: 'error',
       message: error.message
     });
@@ -72,7 +72,7 @@ router.post('/whatsapp/connect', async (req, res) => {
     res.json(result);
   } catch (error) {
     console.error('WhatsApp connection error:', error);
-    res.status(500).json({
+    res.status(500).json({ 
       status: 'error',
       message: error.message
     });

@@ -205,11 +205,46 @@ class MatrixWhatsAppService {
     }
   }
 
+  async updateConnectionStatus(userId, status, bridgeRoomId = null) {
+    try {
+      // Update account status
+      const { error: accountError } = await adminClient
+        .from('accounts')
+        .upsert({
+          user_id: userId,
+          platform: 'whatsapp',
+          status: status,
+          platform_user_id: bridgeRoomId || null,
+          updated_at: new Date().toISOString()
+        }, {
+          onConflict: 'user_id,platform',
+          returning: true
+        });
+
+      if (accountError) throw accountError;
+
+      // Emit status update event
+      const io = getIO();
+      io.to(`user:${userId}`).emit('whatsapp:status_update', {
+        status,
+        bridgeRoomId
+      });
+
+      return true;
+    } catch (error) {
+      console.error('Error updating WhatsApp connection status:', error);
+      throw error;
+    }
+  }
+
   async connectWhatsApp(userId) {
     try {
       console.log('=== Starting WhatsApp Connection Flow ===');
-      console.log('Step 1: Validating Matrix client for user:', userId);
       
+      // Update status to connecting
+      await this.updateConnectionStatus(userId, 'connecting');
+
+      console.log('Step 1: Validating Matrix client for user:', userId);
       const matrixClient = this.matrixClients.get(userId);
       if (!matrixClient) {
         throw new Error('Matrix client not initialized. Please connect to Matrix first.');
@@ -442,19 +477,7 @@ class MatrixWhatsAppService {
                   resolve(successData);
                 });
                 
-                // userSockets.forEach(socket => {
-                //   console.log('Emitting "connected" status to socket:', socket.id);
-                //   socket.emit('whatsapp_status', {
-                //     userId,
-                //     status: 'connected',
-                //     bridgeRoomId: bridgeRoom.room_id,
-                //     qrReceived: true
-                //   });
-                // });
-
- 
-              }
-              
+              } 
             } 
           }
 
@@ -630,7 +653,11 @@ class MatrixWhatsAppService {
         // matrixClient.on('Room.timeline', handleResponse);
       });
 
+      // Update status to connected
+      await this.updateConnectionStatus(userId, 'connected', bridgeRoom.room_id);
+
     } catch (error) {
+      await this.updateConnectionStatus(userId, 'error');
       console.error('=== WhatsApp Connection Flow Failed ===', error);
       throw error;
     }
@@ -642,6 +669,8 @@ class MatrixWhatsAppService {
       if (!connection) {
         throw new Error('No active WhatsApp connection found');
       }
+
+      await this.updateConnectionStatus(userId, 'disconnecting');
 
       const { matrixClient, bridgeRoomId } = connection;
 
@@ -663,12 +692,11 @@ class MatrixWhatsAppService {
 
       this.connections.delete(userId);
 
-      return {
-        status: 'disconnected',
-        message: 'WhatsApp disconnected successfully'
-      };
+      await this.updateConnectionStatus(userId, 'disconnected');
+      return true;
     } catch (error) {
-      console.error('WhatsApp disconnect error:', error);
+      await this.updateConnectionStatus(userId, 'error');
+      console.error('Error disconnecting WhatsApp:', error);
       throw error;
     }
   }

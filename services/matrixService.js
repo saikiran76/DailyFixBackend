@@ -1,5 +1,6 @@
 import sdk from 'matrix-js-sdk';
 import { adminClient } from '../utils/supabase.js';
+import { matrixRoomService } from './matrixRoomService.js';
 
 export const initializeMatrixClient = async (credentials) => {
   let client = null;
@@ -99,6 +100,9 @@ export const initializeMatrixClient = async (credentials) => {
         }
       });
     });
+
+    // Set up room invite handler
+    await matrixRoomService.setupSyncHandler(loginResponse.user_id, authenticatedClient);
 
     console.log('Matrix client initialized successfully for user:', loginResponse.user_id);
 
