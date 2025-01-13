@@ -27,6 +27,7 @@ import adminRoutes from './routes/adminRoutes.js';
 import reportRoutes from './routes/reportRoutes.js';
 import matrixRoutes from './routes/matrixRoutes.js';
 import whatsappEntityRoutes from './routes/whatsappEntityRoutes.js';
+import { syncJobService } from './services/syncJobService.js';
 
 dotenv.config();
 
@@ -125,8 +126,14 @@ async function initializeServices() {
         await initializePlatformBridge(account.user_id, platformAccount.platform);
       }
     }
+
+    // Initialize WhatsApp sync job service
+    console.log('Initializing WhatsApp sync job service...');
+    await syncJobService.start();
+    console.log('WhatsApp sync job service initialized successfully');
+
   } catch (error) {
-    console.error('Matrix/Bridge initialization error:', error);
+    console.error('Matrix/Bridge/Sync initialization error:', error);
     throw error; // Propagate error for recovery mechanism
   }
 }

@@ -1,5 +1,4 @@
-import { supabase } from '../utils/supabase.js';
-import jwt from 'jsonwebtoken';
+import supabase from '../utils/supabase.js';
 
 export const authenticateUser = async (req, res, next) => {
   try {
@@ -13,50 +12,58 @@ export const authenticateUser = async (req, res, next) => {
     }
 
     const token = authHeader.split(' ')[1];
-    console.log('Attempting authentication with token');
     
-    // First try Supabase authentication
     try {
-      const { data: { user }, error: supabaseError } = await supabase.auth.getUser(token);
-      
-      if (!supabaseError && user) {
-        console.log('Supabase authentication successful for user:', user.id);
-        req.user = {
-          id: user.id,
-          email: user.email,
-          ...user.user_metadata
-        };
-        return next();
-      } else {
-        console.log('Supabase authentication failed, trying JWT');
-      }
-    } catch (supabaseError) {
-      console.log('Supabase auth error:', supabaseError.message);
-    }
+      const { data: { user }, error } = await supabase.auth.getUser(token);
 
-    // If Supabase fails, try JWT
-    try {
-      const decoded = jwt.verify(token, process.env.JWT_SECRET);
-      console.log('JWT authentication successful for user:', decoded.id);
+      if (error) {
+        console.error('Token validation error:', error);
+        return res.status(401).json({ 
+          status: 'error',
+          message: 'Invalid or expired token',
+          code: 'TOKEN_INVALID'
+        });
+      }
+
+      if (!user) {
+        console.error('No user found for token');
+        return res.status(401).json({ 
+          status: 'error',
+          message: 'User not found',
+          code: 'USER_NOT_FOUND'
+        });
+      }
+
+      // Add user info to request
       req.user = {
-        id: decoded.id,
-        email: decoded.email
+        id: user.id,
+        email: user.email,
+        ...user.user_metadata
       };
-      return next();
-    } catch (jwtError) {
-      console.error('JWT verification failed:', jwtError.message);
+
+      // Log successful auth
+      console.log('Authenticated user:', {
+        id: req.user.id,
+        email: req.user.email,
+        path: req.path,
+        method: req.method
+      });
+
+      next();
+    } catch (tokenError) {
+      console.error('Token validation failed:', tokenError);
       return res.status(401).json({ 
         status: 'error',
-        message: 'Invalid or expired token',
-        code: 'TOKEN_INVALID'
+        message: 'Token validation failed',
+        code: 'TOKEN_VALIDATION_FAILED'
       });
     }
   } catch (error) {
-    console.error('Authentication error:', error.message);
-    return res.status(401).json({ 
+    console.error('Auth middleware error:', error);
+    res.status(500).json({ 
       status: 'error',
-      message: 'Authentication failed',
-      code: 'AUTH_FAILED'
+      message: 'Authentication service unavailable',
+      code: 'AUTH_SERVICE_ERROR'
     });
   }
 };

@@ -371,391 +371,66 @@ class WhatsAppEntityService {
       // Verify contact belongs to user
       const { data: contact, error: contactError } = await adminClient
         .from('whatsapp_contacts')
-        .select('id, whatsapp_id')
+        .select('id, whatsapp_id, metadata')
         .eq('id', contactId)
         .eq('user_id', userId)
         .single();
 
-      if (contactError) throw contactError;
-      if (!contact) throw new Error('Contact not found');
+      if (contactError || !contact) {
+        throw new Error('Contact not found');
+      }
 
-      // Create sync request
-      const { data: syncRequest, error: syncError } = await adminClient
-        .from('whatsapp_sync_requests')
-        .upsert({
-          user_id: userId,
-          contact_id: contactId,
-          status: 'pending',
-          requested_at: new Date().toISOString()
-        }, {
-          onConflict: 'user_id,contact_id',
-          returning: true
-        })
-        .single();
-
-      if (syncError) throw syncError;
-
-      // Get or initialize Matrix client
-      let matrixClient = matrixWhatsAppService.getMatrixClient(userId);
+      // Get Matrix client
+      const matrixClient = await this.getMatrixClient(userId);
       if (!matrixClient) {
-        try {
-          // Get Matrix account from database
-          const { data: matrixAccount, error: accountError } = await adminClient
-            .from('accounts')
-            .select('credentials')
-            .eq('user_id', userId)
-            .eq('platform', 'matrix')
-            .single();
-
-          if (accountError || !matrixAccount) {
-            throw new Error('Matrix account not found');
-          }
-
-          // Create Matrix client with correct credentials
-          matrixClient = sdk.createClient({
-            baseUrl: matrixAccount.credentials.homeserver,
-            accessToken: matrixAccount.credentials.accessToken,
-            userId: matrixAccount.credentials.userId,
-            timeoutMs: 30000,
-            useAuthorizationHeader: true
-          });
-
-          // Store in service
-          matrixWhatsAppService.matrixClients.set(userId, matrixClient);
-        } catch (initError) {
-          console.error('Matrix client initialization error:', initError);
-          return { status: 'error', message: 'Failed to initialize Matrix client: ' + initError.message };
-        }
+        throw new Error('Matrix client not initialized');
       }
 
-      // Start client if not running
-      if (!matrixClient.clientRunning) {
-        try {
-          console.log('Starting Matrix client...');
-          await matrixClient.startClient();
-          
-          // Wait for initial sync
-          await new Promise((resolve, reject) => {
-            const timeout = setTimeout(() => reject(new Error('Initial sync timeout')), 30000);
-            
-            const checkSync = () => {
-              if (matrixClient.isInitialSyncComplete()) {
-                clearTimeout(timeout);
-                resolve();
-                return;
-              }
-              setTimeout(checkSync, 1000);
-            };
+      // Request sync using Matrix's native sync
+      const syncResult = await matrixWhatsAppService.syncMessages(userId, contactId);
 
-            matrixClient.once('sync', (state) => {
-              if (state === 'PREPARED') {
-                clearTimeout(timeout);
-                resolve();
-              } else if (state === 'ERROR') {
-                clearTimeout(timeout);
-                reject(new Error('Sync failed'));
-              }
-            });
-
-            checkSync();
-          });
-        } catch (startError) {
-          console.error('Failed to start Matrix client:', startError);
-          return { status: 'error', message: 'Failed to sync Matrix client: ' + startError.message };
+      // Return sync request status
+      return {
+        status: 'success',
+        data: {
+          sync_status: 'pending',
+          message: 'Sync initiated using Matrix native sync',
+          details: syncResult
         }
-      }
+      };
 
-      // Step 4: Verify WhatsApp bridge connection and fetch contacts
-      const bridgeRoomId = whatsappAccount.credentials?.bridge_room_id;
-      if (!bridgeRoomId) {
-        return { status: 'error', message: 'WhatsApp bridge room not found' };
-      }
-
-      try {
-        // Get last sync token if available
-        const lastSyncToken = whatsappAccount.credentials?.metadata?.last_sync_token;
-        
-        // Initialize tracking variables
-        const whatsappRooms = new Map();
-        const skippedRooms = [];
-        const savedContacts = [];
-        const updatedContacts = [];
-        const failedContacts = [];
-        
-        // Create a simpler sync filter
-        const filter = {
-          room: {
-            state: { 
-              types: [
-                'm.room.name',
-                'm.room.member',
-                'm.room.topic',
-                'uk.half-shot.bridge'
-              ]
-            },
-            timeline: {
-              limit: 20
-            }
-          }
-        };
-
-        // Get rooms directly without sync
-        console.log('Getting rooms...');
-        const rooms = matrixClient.getRooms();
-        console.log(`Found ${rooms.length} total rooms`);
-
-        // Process each room
-        for (const room of rooms) {
-          try {
-            // Check if room has the bridge bot
-            const bridgeBot = room.getMember(BRIDGE_CONFIGS.whatsapp.bridgeBot);
-            if (!bridgeBot || !['join', 'invite'].includes(bridgeBot.membership)) {
-              skippedRooms.push({ roomId: room.roomId, reason: 'no_bridge_bot' });
-              continue;
-            }
-
-            const roomData = {
-              id: room.roomId,
-              name: room.name,
-              topic: room.currentState.getStateEvents('m.room.topic', '')[0]?.getContent().topic,
-              type: room.getMyMembership(),
-              // Refined group detection logic
-              is_group: (() => {
-                const allMembers = room.getJoinedMembers();
-                const relevantMembers = allMembers.filter(member => 
-                  member.userId !== matrixClient.getUserId() && // Exclude the user themselves
-                  member.userId !== BRIDGE_CONFIGS.whatsapp.bridgeBot // Exclude the WhatsApp bridge bot
-                );
-                return relevantMembers.length > 1; // More than 1 remaining member = group
-              })(),
-              members: room.getJoinedMembers().map(m => ({
-                userId: m.userId,
-                displayName: m.name,
-                membership: m.membership
-              })),
-              bridgeBot: {
-                userId: bridgeBot.userId,
-                displayName: bridgeBot.name
-              },
-              state_events: room.currentState.getStateEvents('uk.half-shot.bridge')
-            };
-
-            whatsappRooms.set(room.roomId, roomData);
-          } catch (error) {
-            console.error(`Error processing room ${room.roomId}:`, error);
-            skippedRooms.push({ roomId: room.roomId, reason: 'processing_error', error: error.message });
-          }
-        }
-
-        console.log(`Found ${whatsappRooms.size} WhatsApp rooms (${skippedRooms.length} skipped)`);
-
-        // Process contacts from rooms
-        for (const [roomId, roomData] of whatsappRooms.entries()) {
-          try {
-            const whatsappId = extractWhatsAppId(roomData);
-            if (!whatsappId) {
-              console.warn(`Could not extract WhatsApp ID for room ${roomId}`);
-              failedContacts.push({ roomId, reason: 'no_whatsapp_id' });
-              continue;
-            }
-
-            // Check if contact already exists
-            const { data: existingContact, error: fetchError } = await adminClient
-              .from('whatsapp_contacts')
-              .select('id, sync_status, metadata')
-              .eq('user_id', userId)
-              .eq('whatsapp_id', whatsappId)
-              .single();
-
-            if (fetchError) {
-              console.error(`Error checking existing contact for room ${roomId}:`, fetchError);
-              failedContacts.push({ 
-                roomId, 
-                reason: 'fetch_error', 
-                error: fetchError.message 
-              });
-              continue;
-            }
-
-            // Prepare contact data
-            const contactData = {
-              user_id: userId,
-              whatsapp_id: whatsappId,
-              display_name: roomData.name || `WhatsApp ${whatsappId}`,
-              bridge_room_id: roomId,
-              sync_status: roomData.type === 'join' ? 'approved' : 'pending',
-              metadata: {
-                room_name: roomData.name,
-                room_topic: roomData.topic,
-                room_type: roomData.type,
-                members: roomData.members,
-                bridge_bot: roomData.bridgeBot,
-                state_events: roomData.state_events,
-                updated_at: new Date().toISOString()
-              }
-            };
-
-            // Validate contact data
-            const validationErrors = [];
-            if (!contactData.user_id) validationErrors.push('missing_user_id');
-            if (!contactData.whatsapp_id) validationErrors.push('missing_whatsapp_id');
-            if (!contactData.bridge_room_id) validationErrors.push('missing_bridge_room_id');
-
-            if (validationErrors.length > 0) {
-              console.error(`Invalid contact data for room ${roomId}:`, validationErrors);
-              failedContacts.push({ 
-                roomId, 
-                reason: 'validation_error', 
-                errors: validationErrors 
-              });
-              continue;
-            }
-
-            // Compare with existing data to check if update needed
-            let needsUpdate = false;
-            if (existingContact) {
-              needsUpdate = (
-                existingContact.sync_status !== contactData.sync_status ||
-                JSON.stringify(existingContact.metadata) !== JSON.stringify(contactData.metadata)
-              );
-            }
-
-            if (existingContact && !needsUpdate) {
-              console.log(`Contact for room ${roomId} is up to date`);
-              continue;
-            }
-
-            // Perform upsert
-            const { data, error } = await adminClient
-              .from('whatsapp_contacts')
-              .upsert(contactData, {
-                onConflict: 'user_id,whatsapp_id',
-                returning: true
-              });
-
-            if (error) {
-              console.error(`Failed to save contact for room ${roomId}:`, error);
-              failedContacts.push({ 
-                roomId, 
-                reason: 'db_error', 
-                error: error.message 
-              });
-            } else {
-              if (existingContact) {
-                updatedContacts.push(data);
-          } else {
-              savedContacts.push(data);
-              }
-            }
-          } catch (error) {
-            console.error(`Error processing contact for room ${roomId}:`, error);
-            failedContacts.push({ 
-              roomId, 
-              reason: 'processing_error', 
-              error: error.message 
-            });
-          }
-        }
-
-        console.log(`Contact sync results:`, {
-          new: savedContacts.length,
-          updated: updatedContacts.length,
-          failed: failedContacts.length,
-          skipped: whatsappRooms.size - (savedContacts.length + updatedContacts.length + failedContacts.length)
-        });
-
-        if (failedContacts.length > 0) {
-          console.warn('Failed contacts:', failedContacts);
-        }
-
-        // Store sync results with enhanced status tracking
-        if (lastSyncToken) {
-          console.log('Storing sync token and results');
-          try {
-            const syncResults = {
-              timestamp: new Date().toISOString(),
-              rooms_found: whatsappRooms.size,
-              rooms_skipped: skippedRooms.length,
-              contacts_new: savedContacts.length,
-              contacts_updated: updatedContacts.length,
-              contacts_failed: failedContacts.length,
-              skipped_rooms: skippedRooms,
-              failed_contacts: failedContacts
-            };
-
-            const { error: updateError } = await adminClient
-              .from('accounts')
-              .update({
-                credentials: {
-                  ...whatsappAccount.credentials,
-                  metadata: {
-                    ...whatsappAccount.credentials?.metadata,
-                    last_sync_token: lastSyncToken,
-                    last_sync_status: syncResults,
-                    sync_history: [
-                      ...(whatsappAccount.credentials?.metadata?.sync_history || []).slice(-4),
-                      syncResults
-                    ]
-                  }
-                }
-              })
-              .eq('user_id', userId)
-              .eq('platform', 'whatsapp');
-
-            if (updateError) {
-              console.error('Failed to store sync results:', updateError);
-            }
-          } catch (error) {
-            console.error('Error storing sync results:', error);
-          }
-        }
-
-        // Send sync request command to bridge bot
-        await matrixClient.sendMessage(BRIDGE_CONFIGS.whatsapp.bridgeBot, {
-          msgtype: 'm.text',
-          body: `!wa sync ${contact.whatsapp_id}`
-        });
-
-        return syncRequest;
-      } catch (error) {
-        console.error('Error processing WhatsApp rooms:', error);
-        throw error;
-      }
     } catch (error) {
       console.error('Error requesting WhatsApp sync:', error);
+      
+      // Update sync request status on error
+      await this.updateSyncStatus(userId, contactId, 'rejected');
+      
       throw error;
     }
   }
 
   async getMessages(userId, contactId, limit = 50, before = null) {
     try {
-      // Verify sync is approved
+      // Check sync request status first
       const { data: syncRequest, error: syncError } = await adminClient
         .from('whatsapp_sync_requests')
         .select('status')
         .eq('user_id', userId)
         .eq('contact_id', contactId)
-        .single();
+        .maybeSingle();
 
       if (syncError) throw syncError;
+
+      // If no sync request exists or it's not approved, trigger a sync
       if (!syncRequest || syncRequest.status !== 'approved') {
-        throw new Error('Sync not approved for this contact');
+        await this.requestSync(userId, contactId);
+        return []; // Return empty array while syncing
       }
 
       // Build query
       let query = adminClient
         .from('whatsapp_messages')
-        .select(`
-          id,
-          message_id,
-          content,
-          sender_id,
-          sender_name,
-          message_type,
-          timestamp,
-          is_read,
-          metadata
-        `)
+        .select('*')
         .eq('user_id', userId)
         .eq('contact_id', contactId)
         .order('timestamp', { ascending: false })
@@ -768,7 +443,7 @@ class WhatsAppEntityService {
       const { data: messages, error } = await query;
       if (error) throw error;
 
-      return messages;
+      return messages || [];
     } catch (error) {
       console.error('Error fetching WhatsApp messages:', error);
       throw error;

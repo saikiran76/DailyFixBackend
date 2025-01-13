@@ -16,6 +16,8 @@ class MatrixWhatsAppService {
     this.connections = new Map();
     this.matrixClients = new Map();
     this.syncStates = new Map();
+    this.messageHandlers = new Map();
+    this.roomToContactMap = new Map();
   }
 
   async validateMatrixClient(userId) {
@@ -656,7 +658,17 @@ class MatrixWhatsAppService {
       // Update status to connected
       await this.updateConnectionStatus(userId, 'connected', bridgeRoom.room_id);
 
+      // Store connection in memory
+      this.connections.set(userId, {
+        matrixClient,
+        bridgeRoomId: bridgeRoom.room_id,
+        status: 'connected'
+      });
+
     } catch (error) {
+      // Clean up any partial connection state
+      this.connections.delete(userId);
+      
       await this.updateConnectionStatus(userId, 'error');
       console.error('=== WhatsApp Connection Flow Failed ===', error);
       throw error;
@@ -703,12 +715,64 @@ class MatrixWhatsAppService {
 
   async getStatus(userId) {
     try {
-      const { data: account } = await supabase
+      // Check in-memory connection first
+      const connection = this.connections.get(userId);
+      
+      // Get database status
+      const { data: account } = await adminClient
         .from('accounts')
         .select('status, credentials')
         .eq('user_id', userId)
         .eq('platform', 'whatsapp')
         .single();
+
+      // If we have an in-memory connection but no database record, something is wrong
+      if (connection && !account) {
+        console.warn('Found in-memory connection but no database record');
+        this.connections.delete(userId); // Clean up inconsistent state
+        return {
+          status: 'inactive',
+          message: 'WhatsApp connection state is inconsistent'
+        };
+      }
+
+      // If we have a database record but no in-memory connection, try to restore it
+      if (account?.status === 'connected' && !connection) {
+        console.warn('Found active database connection but no in-memory state');
+        const matrixClient = this.matrixClients.get(userId);
+        if (matrixClient && account.credentials?.bridge_room_id) {
+          // Verify the bridge room still exists and is accessible
+          try {
+            const room = matrixClient.getRoom(account.credentials.bridge_room_id);
+            if (room) {
+              // Check if bridge bot is still in the room
+              const bridgeBot = room.getMember(BRIDGE_CONFIGS.whatsapp.bridgeBot);
+              if (bridgeBot && bridgeBot.membership === 'join') {
+                // Store connection with full credentials
+                this.connections.set(userId, {
+                  matrixClient,
+                  bridgeRoomId: account.credentials.bridge_room_id,
+                  status: 'connected',
+                  credentials: account.credentials // Store full credentials
+                });
+                console.log('Successfully restored WhatsApp connection state with credentials');
+              } else {
+                console.warn('Bridge bot not found in room, marking as inactive');
+                await this.updateConnectionStatus(userId, 'inactive');
+                account.status = 'inactive';
+              }
+            } else {
+              console.warn('Bridge room not found, marking as inactive');
+              await this.updateConnectionStatus(userId, 'inactive');
+              account.status = 'inactive';
+            }
+          } catch (error) {
+            console.error('Error verifying bridge room:', error);
+            await this.updateConnectionStatus(userId, 'inactive');
+            account.status = 'inactive';
+          }
+        }
+      }
 
       if (!account) {
         return {
@@ -717,10 +781,29 @@ class MatrixWhatsAppService {
         };
       }
 
+      // Verify in-memory connection matches database state
+      if (connection && account.status === 'connected') {
+        try {
+          const room = connection.matrixClient.getRoom(connection.bridgeRoomId);
+          if (!room) {
+            console.warn('Bridge room not found for active connection');
+            this.connections.delete(userId);
+            await this.updateConnectionStatus(userId, 'inactive');
+            account.status = 'inactive';
+          }
+        } catch (error) {
+          console.error('Error verifying connection:', error);
+          this.connections.delete(userId);
+          await this.updateConnectionStatus(userId, 'inactive');
+          account.status = 'inactive';
+        }
+      }
+
       return {
         status: account.status,
         message: `WhatsApp connection is ${account.status}`,
-        bridgeRoomId: account.credentials?.bridge_room_id
+        bridgeRoomId: account.credentials?.bridge_room_id,
+        inMemoryConnection: !!this.connections.get(userId)
       };
     } catch (error) {
       console.error('WhatsApp status check error:', error);
@@ -728,152 +811,260 @@ class MatrixWhatsAppService {
     }
   }
 
-  async syncMessages(userId) {
+  async setupMessageSync(userId, matrixClient) {
+    console.log('Setting up Matrix message sync for user:', userId);
+    
     try {
+      // Get all WhatsApp contacts for the user to build room mapping
+      const { data: contacts, error: contactError } = await adminClient
+        .from('whatsapp_contacts')
+        .select('id, whatsapp_id, metadata')
+        .eq('user_id', userId);
+
+      if (contactError) throw contactError;
+
+      // Build room to contact mapping
+      contacts.forEach(contact => {
+        if (contact.metadata?.room_id) {
+          this.roomToContactMap.set(contact.metadata.room_id, {
+            contactId: contact.id,
+            whatsappId: contact.whatsapp_id
+          });
+        }
+      });
+
+      // Set up timeline listener for all rooms
+      matrixClient.on('Room.timeline', async (event, room, toStartOfTimeline) => {
+        try {
+          // Skip if not a message event
+          if (event.getType() !== 'm.room.message') return;
+          
+          // Skip if from bridge bot or self
+          if (event.getSender() === BRIDGE_CONFIGS.whatsapp.bridgeBot ||
+              event.getSender() === matrixClient.getUserId()) return;
+
+          // Get contact info from room
+          const contactInfo = this.roomToContactMap.get(room.roomId);
+          if (!contactInfo) {
+            console.log('No contact mapping found for room:', room.roomId);
+            return;
+          }
+
+          const content = event.getContent();
+          if (!content || !content.body) return;
+
+          // Prepare message data
+          const messageData = {
+            user_id: userId,
+            contact_id: contactInfo.contactId,
+            message_id: event.getId(),
+            content: content.body,
+            sender_id: event.getSender(),
+            sender_name: room.getMember(event.getSender())?.name || event.getSender(),
+            message_type: content.msgtype === 'm.text' ? 'text' : 'media',
+            metadata: {
+              room_id: room.roomId,
+              event_id: event.getId(),
+              raw_event: event.event
+            },
+            timestamp: new Date(event.getTs()).toISOString(),
+            is_read: false
+          };
+
+          // Store message in database
+          const { error: insertError } = await adminClient
+            .from('whatsapp_messages')
+            .upsert(messageData, {
+              onConflict: 'user_id,message_id',
+              returning: true
+            });
+
+          if (insertError) {
+            console.error('Error storing message:', insertError);
+            return;
+          }
+
+          // Update sync status if needed
+          await this.updateSyncStatus(userId, contactInfo.contactId, 'approved');
+
+          // Emit real-time update
+          global.io?.to(`user:${userId}`).emit('whatsapp:message', messageData);
+
+        } catch (error) {
+          console.error('Error processing timeline event:', error);
+        }
+      });
+
+      // Set up reconnection handler
+      matrixClient.on('sync', async (state, prevState, data) => {
+        console.log('Matrix sync state changed:', state, 'from:', prevState);
+        
+        if (state === 'ERROR') {
+          console.error('Matrix sync error:', data);
+          // Attempt to reconnect
+          setTimeout(() => {
+            console.log('Attempting to reconnect Matrix client...');
+            matrixClient.startClient().catch(err => 
+              console.error('Reconnection failed:', err)
+            );
+          }, 5000);
+        }
+      });
+
+      console.log('Message sync setup completed for user:', userId);
+      return true;
+    } catch (error) {
+      console.error('Error setting up message sync:', error);
+      throw error;
+    }
+  }
+
+  async syncMessages(userId, contactId) {
+    try {
+      console.log('Starting message sync for user:', userId, 'contact:', contactId);
+
+      // Get current status and attempt to restore connection if needed
+      const status = await this.getStatus(userId);
+      console.log('Current WhatsApp status:', status);
+
       // Validate connection
-      const connection = this.connections.get(userId);
+      let connection = this.connections.get(userId);
       if (!connection) {
-        throw new Error('No active WhatsApp connection found');
+        if (status.status === 'connected' || status.status === 'active') {
+          console.log('Attempting to restore WhatsApp connection...');
+          
+          // Get Matrix client
+          const matrixClient = this.matrixClients.get(userId);
+          if (!matrixClient) {
+            throw new Error('Matrix client not initialized');
+          }
+
+          // Get account details
+          const { data: account } = await adminClient
+            .from('accounts')
+            .select('credentials')
+            .eq('user_id', userId)
+            .eq('platform', 'whatsapp')
+            .single();
+
+          if (!account?.credentials?.bridge_room_id) {
+            throw new Error('Invalid WhatsApp account configuration');
+          }
+
+          // Verify bridge room
+          const room = matrixClient.getRoom(account.credentials.bridge_room_id);
+          if (!room) {
+            throw new Error('Bridge room not found');
+          }
+
+          // Store connection
+          this.connections.set(userId, {
+            matrixClient,
+            bridgeRoomId: account.credentials.bridge_room_id,
+            status: 'connected',
+            credentials: account.credentials
+          });
+
+          connection = this.connections.get(userId);
+          console.log('WhatsApp connection restored successfully');
+        }
+
+        if (!connection) {
+          throw new Error('No active WhatsApp connection found');
+        }
       }
 
       // Validate Matrix client
-      const isValid = await this.validateMatrixClient(userId);
-      if (!isValid) {
-        throw new Error('Matrix client validation failed');
+      const matrixClient = this.matrixClients.get(userId);
+      if (!matrixClient) {
+        throw new Error('Matrix client not initialized');
       }
 
-      const { matrixClient, bridgeRoomId } = connection;
+      // Get contact details
+      const { data: contact, error: contactError } = await adminClient
+        .from('whatsapp_contacts')
+        .select('whatsapp_id, metadata')
+        .eq('id', contactId)
+        .eq('user_id', userId)
+        .single();
 
-      // Check if sync is already in progress
-      if (this.syncStates.get(userId) === 'syncing') {
-        return {
-          status: 'syncing',
-          message: 'Message synchronization already in progress'
-        };
+      if (contactError || !contact) {
+        throw new Error('Contact not found');
       }
 
-      // Set initial sync state
-      this.syncStates.set(userId, 'syncing');
+      // Ensure message sync is set up
+      if (!this.messageHandlers.has(userId)) {
+        await this.setupMessageSync(userId, matrixClient);
+      }
 
-      // Send sync command
-      await matrixClient.sendMessage(bridgeRoomId, {
-        msgtype: 'm.text',
-        body: BRIDGE_CONFIGS.whatsapp.syncCommand
-      });
+      // Update room mapping if needed
+      if (contact.metadata?.room_id) {
+        this.roomToContactMap.set(contact.metadata.room_id, {
+          contactId: contactId,
+          whatsappId: contact.whatsapp_id
+        });
+      }
 
-      // Monitor sync progress with enhanced error handling
-      return new Promise((resolve, reject) => {
-        const cleanup = () => {
-          clearTimeout(timeout);
-          matrixClient.removeListener('Room.timeline', handleResponse);
-          this.syncStates.delete(userId);
-        };
+      // Create or update sync request
+      const { error: syncError } = await adminClient
+        .from('whatsapp_sync_requests')
+        .upsert({
+          user_id: userId,
+          contact_id: contactId,
+          status: 'pending',
+          requested_at: new Date().toISOString()
+        }, {
+          onConflict: 'user_id,contact_id'
+        });
 
+      if (syncError) throw syncError;
+
+      // Get room and ensure timeline is initialized
+      const room = matrixClient.getRoom(contact.metadata.room_id);
+      if (!room) {
+        throw new Error('Room not found');
+      }
+
+      // Wait for timeline to be ready
+      await new Promise((resolve, reject) => {
         const timeout = setTimeout(() => {
-          cleanup();
-          reject(new Error('Message sync timeout'));
-        }, BRIDGE_TIMEOUTS.whatsappSync);
+          reject(new Error('Timeline initialization timeout'));
+        }, 10000);
 
-        let lastProgress = 0;
-        let lastUpdate = Date.now();
-        const progressTimeout = 30000; // 30 seconds
-
-        const handleResponse = async (event, room) => {
-          if (room.roomId !== bridgeRoomId) return;
-          if (event.getType() !== 'm.room.message') return;
-
-          const content = event.getContent().body;
-
-          // Handle sync progress updates
-          if (content.includes(BRIDGE_CONFIGS.whatsapp.syncProgressPrefix)) {
-            const progressMatch = content.match(/Sync progress: (\d+)%/);
-            if (progressMatch) {
-              const progress = parseInt(progressMatch[1], 10);
-              
-              // Validate progress value
-              if (isNaN(progress) || progress < 0 || progress > 100) {
-                cleanup();
-                reject(new Error('Invalid sync progress value received'));
-                return;
-              }
-
-              // Check for progress timeout
-              const now = Date.now();
-              if (progress > lastProgress) {
-                lastProgress = progress;
-                lastUpdate = now;
-                
-                // Emit progress update with detailed info
-                ioEmitter.emit('whatsapp_sync_progress', {
-                  userId,
-                  progress,
-                  status: 'syncing',
-                  details: {
-                    timestamp: new Date().toISOString(),
-                    timeElapsed: Math.floor((now - lastUpdate) / 1000),
-                    estimatedTimeRemaining: Math.floor(((100 - progress) * (now - lastUpdate)) / (progress - lastProgress))
-                  }
-                });
-
-                if (progress === 100) {
-                  cleanup();
-                  
-                  // Update sync state in database
-                  await supabase
-                    .from('accounts')
-                    .update({
-                      last_sync: new Date().toISOString(),
-                      sync_status: 'completed'
-                    })
-                    .eq('user_id', userId)
-                    .eq('platform', 'whatsapp');
-
-                  resolve({
-                    status: 'completed',
-                    message: 'Message synchronization completed'
-                  });
-                }
-              } else if (now - lastUpdate > progressTimeout) {
-                cleanup();
-                reject(new Error('Sync progress timeout - no updates received'));
-              }
-            }
-          }
-
-          // Handle sync errors with detailed information
-          if (content.includes(BRIDGE_CONFIGS.whatsapp.syncErrorPrefix)) {
-            cleanup();
-            const errorMessage = content.replace(BRIDGE_CONFIGS.whatsapp.syncErrorPrefix, '').trim();
-            
-            // Update sync state in database
-            await supabase
-              .from('accounts')
-              .update({
-                last_sync_error: errorMessage,
-                sync_status: 'error'
-              })
-              .eq('user_id', userId)
-              .eq('platform', 'whatsapp');
-
-            reject(new Error(errorMessage));
+        const checkTimeline = () => {
+          if (room.timeline && room.timeline.length > 0) {
+            clearTimeout(timeout);
+            resolve();
+          } else {
+            // Request a small initial sync to initialize timeline
+            matrixClient.createMessagesRequest(
+              contact.metadata.room_id,
+              null,
+              20,
+              'm.room.message'
+            ).then(() => {
+              setTimeout(checkTimeline, 500);
+            }).catch(error => {
+              clearTimeout(timeout);
+              reject(error);
+            });
           }
         };
 
-        matrixClient.on('Room.timeline', handleResponse);
+        checkTimeline();
       });
+
+      // Now that timeline is initialized, request scrollback
+      await matrixClient.scrollback(room, 50);
+
+      return {
+        status: 'syncing',
+        message: 'Message synchronization initiated'
+      };
+
     } catch (error) {
       console.error('Message sync error:', error);
-      
-      // Update sync state in database
-      await supabase
-        .from('accounts')
-        .update({
-          last_sync_error: error.message,
-          sync_status: 'error'
-        })
-        .eq('user_id', userId)
-        .eq('platform', 'whatsapp');
-
+      this.syncStates.delete(userId);
       throw error;
     }
   }
@@ -881,6 +1072,112 @@ class MatrixWhatsAppService {
   getMatrixClient(userId) {
     return this.matrixClients.get(userId);
   }
+
+  async updateSyncStatus(userId, contactId, status) {
+    try {
+      const { error: updateError } = await adminClient
+        .from('whatsapp_sync_requests')
+        .update({ status })
+        .eq('user_id', userId)
+        .eq('contact_id', contactId);
+
+      if (updateError) throw updateError;
+    } catch (err) {
+      console.error('Error updating sync status:', err);
+    }
+  }
+
+  async handleMessage(userId, event) {
+    try {
+      const roomId = event.getRoomId();
+      const contactInfo = this.roomToContactMap.get(roomId);
+  
+      if (!contactInfo) {
+        console.log('No contact mapping found for room:', roomId);
+        return;
+      }
+  
+      const content = event.getContent();
+      if (!content || !content.body) return;
+  
+      // Determine the message type
+      let messageType;
+      switch (content.msgtype) {
+        case 'm.image':
+          messageType = 'image';
+          break;
+        case 'm.video':
+          messageType = 'video';
+          break;
+        case 'm.audio':
+          messageType = 'audio';
+          break;
+        case 'm.file':
+          const fileName = (content.body || '').toLowerCase();
+          const mimeType = (content.info?.mimetype || '').toLowerCase();
+  
+          if (mimeType.startsWith('video/') || fileName.match(/\.(mp4|mov|avi|mkv)$/)) {
+            messageType = 'video';
+          } else if (mimeType.startsWith('audio/') || fileName.match(/\.(mp3|wav|ogg|m4a)$/)) {
+            messageType = 'audio';
+          } else if (mimeType.startsWith('image/') || fileName.match(/\.(jpg|jpeg|png|gif|webp)$/)) {
+            messageType = 'image';
+          } else {
+            messageType = 'document';
+          }
+          break;
+        case 'm.text':
+        default:
+          messageType = 'text';
+      }
+  
+      // Ensure messageType is valid
+      const ALLOWED_TYPES = ['text', 'image', 'video', 'audio', 'document'];
+      if (!ALLOWED_TYPES.includes(messageType)) {
+        console.warn(`Invalid message type "${messageType}" detected, defaulting to "text"`);
+        messageType = 'text';
+      }
+  
+      // Prepare message data
+      const messageData = {
+        user_id: userId,
+        contact_id: contactInfo.contactId,
+        message_id: event.getId(),
+        content: content.body || '',
+        sender_id: event.getSender(),
+        sender_name: event.sender?.name || event.getSender(),
+        message_type: messageType,
+        metadata: {
+          room_id: roomId,
+          event_type: event.getType(),
+          content: content
+        },
+        timestamp: new Date(event.getTs()).toISOString(),
+        is_read: false
+      };
+  
+      console.log('Final message data:', messageData);
+  
+      // Store the message in the database
+      const { error: insertError } = await adminClient
+        .from('whatsapp_messages')
+        .insert(messageData);
+  
+      if (insertError) {
+        console.error('Error storing message:', insertError);
+        throw insertError;
+      }
+  
+      // Update sync status
+      await this.updateSyncStatus(userId, contactInfo.contactId, 'completed');
+    } catch (error) {
+      console.error('Error processing timeline event:', error);
+      if (contactInfo) {
+        await this.updateSyncStatus(userId, contactInfo.contactId, 'error');
+      }
+    }
+  }
+  
 }
 
 export const matrixWhatsAppService = new MatrixWhatsAppService(); 
