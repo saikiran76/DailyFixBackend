@@ -411,19 +411,31 @@ class WhatsAppEntityService {
 
   async getMessages(userId, contactId, limit = 50, before = null) {
     try {
-      // Check sync request status first
+      // First get the contact record to ensure it exists and belongs to user
+      const { data: contact, error: contactError } = await adminClient
+        .from('whatsapp_contacts')
+        .select('id, whatsapp_id, metadata')
+        .eq('id', contactId)
+        .eq('user_id', userId)
+        .single();
+
+      if (contactError || !contact) {
+        throw new Error('Contact not found');
+      }
+
+      // Check sync request status
       const { data: syncRequest, error: syncError } = await adminClient
         .from('whatsapp_sync_requests')
         .select('status')
         .eq('user_id', userId)
-        .eq('contact_id', contactId)
+        .eq('contact_id', contact.id)
         .maybeSingle();
 
       if (syncError) throw syncError;
 
       // If no sync request exists or it's not approved, trigger a sync
       if (!syncRequest || syncRequest.status !== 'approved') {
-        await this.requestSync(userId, contactId);
+        await this.requestSync(userId, contact.id);
         return []; // Return empty array while syncing
       }
 
@@ -432,7 +444,7 @@ class WhatsAppEntityService {
         .from('whatsapp_messages')
         .select('*')
         .eq('user_id', userId)
-        .eq('contact_id', contactId)
+        .eq('contact_id', contact.id)
         .order('timestamp', { ascending: false })
         .limit(limit);
 

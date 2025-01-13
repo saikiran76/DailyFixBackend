@@ -53,9 +53,18 @@ router.get('/contacts/:contactId/messages', validateRequest(['contactId']), asyn
     const { contactId } = req.params;
     const { limit, before } = req.query;
 
+    // Parse contact ID and validate
+    const parsedContactId = parseInt(contactId);
+    if (isNaN(parsedContactId)) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'Invalid contact ID format'
+      });
+    }
+
     const messages = await whatsappEntityService.getMessages(
       userId,
-      parseInt(contactId),
+      parsedContactId,
       limit ? parseInt(limit) : undefined,
       before
     );
@@ -66,6 +75,12 @@ router.get('/contacts/:contactId/messages', validateRequest(['contactId']), asyn
     });
   } catch (error) {
     console.error('Error fetching messages:', error);
+    if (error.message === 'Contact not found') {
+      return res.status(404).json({
+        status: 'error',
+        message: error.message
+      });
+    }
     res.status(error.message.includes('not approved') ? 403 : 500).json({
       status: 'error',
       message: error.message
