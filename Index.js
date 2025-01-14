@@ -204,18 +204,29 @@ async function initializeDatabase() {
   }
 }
 
-// Add routes
+// Add routes in order of specificity
+// Authentication routes first
 app.use('/auth', authRoutes);
-app.use('/connect', connectRoutes);
-app.use('/reports', reportRoutes);
+
+// Platform-specific routes
 app.use('/matrix', matrixRoutes);
-app.use('/accounts', accountRoutes);
+app.use('/api/whatsapp-entities', whatsappEntityRoutes);
+
+// General platform and connection routes
+app.use('/connect', connectRoutes);
 app.use('/platforms', platformRoutes);
 app.use('/bridge', bridgeRoutes);
+
+// User and account management routes
+app.use('/accounts', accountRoutes);
 app.use('/user', userRoutes);
 app.use('/onboarding', onboardingRoutes);
+
+// Administrative routes
 app.use('/admin', adminRoutes);
-app.use('/api/whatsapp-entities', whatsappEntityRoutes);
+app.use('/reports', reportRoutes);
+
+// Global error handler should be last
 app.use(errorHandler);
 
 // Start server only after database is initialized

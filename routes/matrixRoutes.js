@@ -337,49 +337,7 @@ router.post('/whatsapp/update-status', authMiddleware, async (req, res) => {
   }
 });
 
-// Accept room invitation
-router.post('/whatsapp/accept-invite', authMiddleware, async (req, res) => {
-  try {
-    const { roomId } = req.body;
-    const userId = req.user.id;
-
-    console.log('Accepting room invitation:', {
-      userId,
-      roomId
-    });
-
-    if (!roomId) {
-      return res.status(400).json({
-        status: 'error',
-        message: 'Room ID is required'
-      });
-    }
-
-    // Get Matrix client for user
-    const matrixClient = matrixWhatsAppService.getMatrixClient(userId);
-    if (!matrixClient) {
-      throw new Error('Matrix client not found');
-    }
-
-    // Join the room
-    await matrixClient.joinRoom(roomId);
-
-    console.log('Successfully joined room:', roomId);
-
-    res.json({
-      status: 'success',
-      message: 'Room invitation accepted'
-    });
-  } catch (error) {
-    console.error('Error accepting room invitation:', error);
-    res.status(500).json({
-      status: 'error',
-      message: error.message || 'Failed to accept room invitation'
-    });
-  }
-});
-
-// Get pending room invites
+// Remove duplicate routes
 router.get('/whatsapp/invites', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.id;
@@ -400,7 +358,7 @@ router.get('/whatsapp/invites', authMiddleware, async (req, res) => {
   }
 });
 
-// Accept room invite
+// Single accept-invite route
 router.post('/whatsapp/accept-invite', authMiddleware, async (req, res) => {
   try {
     const { roomId } = req.body;
@@ -426,35 +384,6 @@ router.post('/whatsapp/accept-invite', authMiddleware, async (req, res) => {
       status: 'error',
       message: error.message || 'Failed to accept room invitation'
     });
-  }
-});
-
-// Get pending WhatsApp room invites
-router.get('/whatsapp/invites', authMiddleware, async (req, res) => {
-  try {
-    const matrixWhatsAppService = req.app.get('matrixWhatsAppService');
-    const pendingInvites = await matrixWhatsAppService.getPendingInvites(req.user.id);
-    res.json({ success: true, data: pendingInvites });
-  } catch (error) {
-    console.error('Error getting pending invites:', error);
-    res.status(500).json({ success: false, error: 'Failed to get pending invites' });
-  }
-});
-
-// Accept a WhatsApp room invite
-router.post('/whatsapp/accept-invite', authMiddleware, async (req, res) => {
-  try {
-    const { roomId } = req.body;
-    if (!roomId) {
-      return res.status(400).json({ success: false, error: 'Room ID is required' });
-    }
-
-    const matrixWhatsAppService = req.app.get('matrixWhatsAppService');
-    await matrixWhatsAppService.acceptRoomInvite(req.user.id, roomId);
-    res.json({ success: true, message: 'Room invite accepted' });
-  } catch (error) {
-    console.error('Error accepting room invite:', error);
-    res.status(500).json({ success: false, error: 'Failed to accept room invite' });
   }
 });
 

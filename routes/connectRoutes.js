@@ -64,36 +64,4 @@ router.post('/:platform/disconnect', async (req, res) => {
   }
 });
 
-// WhatsApp-specific routes
-router.post('/whatsapp/connect', async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const result = await matrixWhatsAppService.connectWhatsApp(userId);
-    res.json(result);
-  } catch (error) {
-    console.error('WhatsApp connection error:', error);
-    res.status(500).json({ 
-      status: 'error',
-      message: error.message
-    });
-  }
-});
-
-router.get('/whatsapp/status', async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const isValid = await matrixWhatsAppService.validateMatrixClient(userId);
-    res.json({
-      status: 'success',
-      connected: isValid
-    });
-  } catch (error) {
-    console.error('WhatsApp status check error:', error);
-    res.status(500).json({
-      status: 'error',
-      message: error.message
-    });
-  }
-});
-
 export default router;

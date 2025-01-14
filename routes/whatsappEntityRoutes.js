@@ -53,37 +53,44 @@ router.get('/contacts/:contactId/messages', validateRequest(['contactId']), asyn
     const { contactId } = req.params;
     const { limit, before } = req.query;
 
-    // Parse contact ID and validate
-    const parsedContactId = parseInt(contactId);
-    if (isNaN(parsedContactId)) {
+    console.log('[Messages Route] Request received:', {
+      userId,
+      contactId,
+      limit,
+      before,
+      headers: req.headers,
+      query: req.query
+    });
+
+    // Validate parameters
+    if (!userId || !contactId) {
+      console.error('[Messages Route] Missing required parameters:', { userId, contactId });
       return res.status(400).json({
         status: 'error',
-        message: 'Invalid contact ID format'
+        message: 'Missing required parameters'
       });
     }
 
+    console.log('[Messages Route] Calling getMessages service');
     const messages = await whatsappEntityService.getMessages(
       userId,
-      parsedContactId,
+      parseInt(contactId),
       limit ? parseInt(limit) : undefined,
       before
     );
 
+    console.log(`[Messages Route] Successfully retrieved ${messages?.length || 0} messages`);
     res.json({
       status: 'success',
       data: messages
     });
   } catch (error) {
-    console.error('Error fetching messages:', error);
-    if (error.message === 'Contact not found') {
-      return res.status(404).json({
-        status: 'error',
-        message: error.message
-      });
-    }
+    console.error('[Messages Route] Error:', error);
+    console.error('[Messages Route] Stack:', error.stack);
     res.status(error.message.includes('not approved') ? 403 : 500).json({
       status: 'error',
-      message: error.message
+      message: error.message,
+      details: error.stack
     });
   }
 });
@@ -117,16 +124,16 @@ router.put('/contacts/:contactId/sync', validateRequest(['contactId', 'status'])
 });
 
 // Mark messages as read
-router.put('/contacts/:contactId/messages/read', validateRequest(['contactId', 'messageIds']), async (req, res) => {
+router.post('/contacts/:contactId/messages/read', validateRequest(['contactId']), async (req, res) => {
   try {
     const userId = req.user.id;
     const { contactId } = req.params;
     const { messageIds } = req.body;
 
-    if (!Array.isArray(messageIds)) {
+    if (!Array.isArray(messageIds) || messageIds.length === 0) {
       return res.status(400).json({
         status: 'error',
-        message: 'messageIds must be an array'
+        message: 'messageIds must be a non-empty array'
       });
     }
 
