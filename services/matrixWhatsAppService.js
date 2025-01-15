@@ -1397,6 +1397,25 @@ class MatrixWhatsAppService {
       throw error;
     }
   }
+
+  setMatrixClient(userId, client) {
+    if (!userId || !client) {
+      console.error('[Matrix Service] Invalid parameters for setMatrixClient:', { 
+        hasUserId: !!userId, 
+        hasClient: !!client 
+      });
+      return false;
+    }
+    
+    try {
+      this.matrixClients.set(userId, client);
+      console.log('[Matrix Service] Successfully stored Matrix client for user:', userId);
+      return true;
+    } catch (error) {
+      console.error('[Matrix Service] Error storing Matrix client:', error);
+      return false;
+    }
+  }
 }
 
 export const matrixWhatsAppService = new MatrixWhatsAppService(); 

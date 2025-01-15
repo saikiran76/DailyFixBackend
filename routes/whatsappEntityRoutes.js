@@ -2,6 +2,7 @@ import express from 'express';
 import { authenticateUser } from '../middleware/auth.js';
 import { whatsappEntityService } from '../services/whatsappEntityService.js';
 import { validateRequest } from '../middleware/validation.js';
+import { adminClient } from '../utils/supabase.js';
 
 const router = express.Router();
 
@@ -12,13 +13,59 @@ router.use(authenticateUser);
 router.get('/contacts', async (req, res) => {
   try {
     const userId = req.user.id;
-    const contacts = await whatsappEntityService.getContacts(userId);
+    const { force } = req.query;
+
+    console.log('[WhatsApp Contacts Route] Fetching contacts:', {
+      userId,
+      forceSync: force === 'true'
+    });
+
+    const contacts = await whatsappEntityService.getContacts(userId, force === 'true');
     res.json({
       status: 'success',
       data: contacts
     });
   } catch (error) {
     console.error('Error fetching contacts:', error);
+    res.status(500).json({
+      status: 'error',
+      message: error.message
+    });
+  }
+});
+
+// Get single contact details
+router.get('/contacts/:contactId', validateRequest(['contactId']), async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { contactId } = req.params;
+
+    console.log('[WhatsApp Contact Route] Fetching contact details:', {
+      userId,
+      contactId
+    });
+
+    const { data: contact, error } = await adminClient
+      .from('whatsapp_contacts')
+      .select('*')
+      .eq('user_id', userId)
+      .eq('id', parseInt(contactId))
+      .single();
+
+    if (error) throw error;
+    if (!contact) {
+      return res.status(404).json({
+        status: 'error',
+        message: 'Contact not found'
+      });
+    }
+
+    res.json({
+      status: 'success',
+      data: contact
+    });
+  } catch (error) {
+    console.error('Error fetching contact:', error);
     res.status(500).json({
       status: 'error',
       message: error.message
@@ -53,25 +100,29 @@ router.get('/contacts/:contactId/messages', validateRequest(['contactId']), asyn
     const { contactId } = req.params;
     const { limit, before } = req.query;
 
-    console.log('[Messages Route] Request received:', {
+    console.log('[WhatsApp Messages Route] Received request:', {
+      method: req.method,
+      url: req.url,
+      params: req.params,
+      query: req.query,
+      headers: {
+        ...req.headers,
+        authorization: req.headers.authorization ? '[REDACTED]' : undefined
+      },
       userId,
-      contactId,
-      limit,
-      before,
-      headers: req.headers,
-      query: req.query
+      contactId
     });
 
     // Validate parameters
     if (!userId || !contactId) {
-      console.error('[Messages Route] Missing required parameters:', { userId, contactId });
+      console.error('[WhatsApp Messages Route] Missing required parameters:', { userId, contactId });
       return res.status(400).json({
         status: 'error',
         message: 'Missing required parameters'
       });
     }
 
-    console.log('[Messages Route] Calling getMessages service');
+    console.log('[WhatsApp Messages Route] Calling getMessages service');
     const messages = await whatsappEntityService.getMessages(
       userId,
       parseInt(contactId),
@@ -79,7 +130,12 @@ router.get('/contacts/:contactId/messages', validateRequest(['contactId']), asyn
       before
     );
 
-    console.log(`[Messages Route] Successfully retrieved ${messages?.length || 0} messages`);
+    console.log(`[WhatsApp Messages Route] Service response:`, {
+      messageCount: messages?.length || 0,
+      firstMessageTimestamp: messages?.[0]?.timestamp,
+      lastMessageTimestamp: messages?.[messages?.length - 1]?.timestamp
+    });
+
     res.json({
       status: 'success',
       data: messages

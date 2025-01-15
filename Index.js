@@ -27,6 +27,7 @@ import adminRoutes from './routes/adminRoutes.js';
 import reportRoutes from './routes/reportRoutes.js';
 import matrixRoutes from './routes/matrixRoutes.js';
 import whatsappEntityRoutes from './routes/whatsappEntityRoutes.js';
+import aiAnalysisRoutes from './routes/aiAnalysis.js';
 import { syncJobService } from './services/syncJobService.js';
 
 dotenv.config();
@@ -211,6 +212,7 @@ app.use('/auth', authRoutes);
 // Platform-specific routes
 app.use('/matrix', matrixRoutes);
 app.use('/api/whatsapp-entities', whatsappEntityRoutes);
+app.use('/api/analysis', aiAnalysisRoutes);
 
 // General platform and connection routes
 app.use('/connect', connectRoutes);
@@ -228,6 +230,9 @@ app.use('/reports', reportRoutes);
 
 // Global error handler should be last
 app.use(errorHandler);
+
+// Register AI Analysis routes
+app.use('/api/analysis', aiAnalysisRoutes);
 
 // Start server only after database is initialized
 async function startServer() {
