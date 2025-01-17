@@ -6,6 +6,7 @@ import cookieParser from 'cookie-parser';
 import session from 'express-session';
 import { Server } from 'socket.io';
 import dotenv from 'dotenv';
+import { setIO } from './utils/socket.js';
 
 import { initializeMatrixClient } from './services/matrixService.js';
 import { initializePlatformBridge } from './services/matrixBridgeService.js';
@@ -23,7 +24,11 @@ import { initializeSocketServer } from './services/socketService.js';
 import userRoutes from './routes/userRoutes.js';
 import onboardingRoutes from './routes/onboardingRoutes.js';
 import adminRoutes from './routes/adminRoutes.js';
-
+import reportRoutes from './routes/reportRoutes.js';
+import matrixRoutes from './routes/matrixRoutes.js';
+import whatsappEntityRoutes from './routes/whatsappEntityRoutes.js';
+import aiAnalysisRoutes from './routes/aiAnalysis.js';
+import { syncJobService } from './services/syncJobService.js';
 
 dotenv.config();
 
@@ -73,8 +78,9 @@ const server = http.createServer(app);
 // Initialize socket.io with the server
 const io = initializeSocketServer(server);
 
-// Make io available to routes
+// Make io available to routes and set in socket utility
 app.set('io', io);
+setIO(io);
 
 // Initialize Matrix clients and bridges
 async function initializeServices() {
@@ -121,8 +127,14 @@ async function initializeServices() {
         await initializePlatformBridge(account.user_id, platformAccount.platform);
       }
     }
+
+    // Initialize WhatsApp sync job service
+    console.log('Initializing WhatsApp sync job service...');
+    await syncJobService.start();
+    console.log('WhatsApp sync job service initialized successfully');
+
   } catch (error) {
-    console.error('Matrix/Bridge initialization error:', error);
+    console.error('Matrix/Bridge/Sync initialization error:', error);
     throw error; // Propagate error for recovery mechanism
   }
 }
@@ -193,17 +205,34 @@ async function initializeDatabase() {
   }
 }
 
-// Add routes
+// Add routes in order of specificity
+// Authentication routes first
 app.use('/auth', authRoutes);
+
+// Platform-specific routes
+app.use('/matrix', matrixRoutes);
+app.use('/api/whatsapp-entities', whatsappEntityRoutes);
+app.use('/api/analysis', aiAnalysisRoutes);
+
+// General platform and connection routes
 app.use('/connect', connectRoutes);
-app.use('/matrix', matrixRoomRoutes);
-app.use('/accounts', accountRoutes);
 app.use('/platforms', platformRoutes);
 app.use('/bridge', bridgeRoutes);
+
+// User and account management routes
+app.use('/accounts', accountRoutes);
 app.use('/user', userRoutes);
 app.use('/onboarding', onboardingRoutes);
+
+// Administrative routes
 app.use('/admin', adminRoutes);
+app.use('/reports', reportRoutes);
+
+// Global error handler should be last
 app.use(errorHandler);
+
+// Register AI Analysis routes
+app.use('/api/analysis', aiAnalysisRoutes);
 
 // Start server only after database is initialized
 async function startServer() {

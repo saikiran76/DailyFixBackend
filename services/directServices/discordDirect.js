@@ -275,98 +275,246 @@ class ConnectionManager {
     }
   }
 
-  async getChannels(userId, serverId) {
-    try {
-      // Validate token first
-      const isValid = await this.validateAndRefreshToken(userId);
-      if (!isValid) {
-        throw new Error('Discord token validation failed');
-      }
+  // async getChannels(userId, serverId) {
+  //   try {
+  //       // Validate and refresh token if needed
+  //       const isValid = await this.validateAndRefreshToken(userId);
+  //       if (!isValid) {
+  //           throw new Error('Failed to validate Discord token');
+  //       }
 
-      const { data: account } = await adminClient
-        .from('accounts')
-        .select('credentials, channels_config')
-        .eq('user_id', userId)
-        .eq('platform', 'discord')
-        .single();
+  //       // Get latest token after validation
+  //       const latestToken = await this.getLatestToken(userId);
+        
+  //       // Get channels from Discord API
+  //       const response = await fetch(`${DISCORD_API_URL}/guilds/${serverId}/channels`, {
+  //           headers: {
+  //               Authorization: `Bearer ${latestToken.access_token}`
+  //           }
+  //       });
 
-      if (!account?.credentials?.access_token) {
-        throw new Error('No Discord access token found');
-      }
+  //       if (!response.ok) {
+  //           // Handle rate limiting
+  //           if (response.status === 429) {
+  //               const retryAfter = parseInt(response.headers.get('Retry-After') || '5', 10);
+  //               console.log(`Rate limited, retrying after ${retryAfter} seconds`);
+  //               await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
+  //               return this.getChannels(userId, serverId);
+  //           }
+  //           throw new Error(`Failed to fetch Discord channels: ${response.status}`);
+  //       }
 
-      // Get channels from Discord API
-      const response = await fetch(`${DISCORD_API_URL}/guilds/${serverId}/channels`, {
-        headers: {
-          Authorization: `Bearer ${account.credentials.access_token}`
+  //       const channels = await response.json();
+
+  //       // Cache the channel data
+  //       const { data: account } = await adminClient
+  //           .from('accounts')
+  //           .select('channels_config')
+  //           .eq('user_id', userId)
+  //           .eq('platform', 'discord')
+  //           .single();
+
+  //       const updatedChannelsConfig = {
+  //           ...(account?.channels_config || {}),
+  //           [`server_${serverId}_channels`]: channels.map(channel => ({
+  //               id: channel.id,
+  //               name: channel.name,
+  //               type: channel.type,
+  //               position: channel.position,
+  //               parent_id: channel.parent_id,
+  //               updated_at: new Date().toISOString()
+  //           }))
+  //       };
+
+  //       // Update cache in background
+  //       adminClient
+  //           .from('accounts')
+  //           .update({
+  //               channels_config: updatedChannelsConfig,
+  //               updated_at: new Date().toISOString()
+  //           })
+  //           .eq('user_id', userId)
+  //           .eq('platform', 'discord')
+  //           .then(() => console.log('Channel cache updated'))
+  //           .catch(err => console.error('Failed to update channel cache:', err));
+
+  //       return {
+  //           status: 'success',
+  //           data: channels,
+  //           meta: {
+  //               total: channels.length,
+  //               hasMore: false
+  //           }
+  //       };
+  //   } catch (error) {
+  //       console.error(`Error fetching Discord channels for ${userId}:`, error);
+        
+  //       // Try to return cached data
+  //       try {
+  //           const { data: account } = await adminClient
+  //               .from('accounts')
+  //               .select('channels_config')
+  //               .eq('user_id', userId)
+  //               .eq('platform', 'discord')
+  //               .single();
+
+  //           if (account?.channels_config?.[`server_${serverId}_channels`]?.length > 0) {
+  //               console.log('Returning cached channel data');
+  //               return {
+  //                   status: 'success',
+  //                   data: account.channels_config[`server_${serverId}_channels`],
+  //                   meta: {
+  //                       total: account.channels_config[`server_${serverId}_channels`].length,
+  //                       hasMore: false,
+  //                       fromCache: true
+  //                   }
+  //               };
+  //           }
+  //       } catch (cacheError) {
+  //           console.error('Cache retrieval failed:', cacheError);
+  //       }
+        
+  //       throw {
+  //           status: 'error',
+  //           message: error.message,
+  //           details: error.toString()
+  //       };
+  //   }
+  // }
+
+  async getChannels(userId, serverId) {  
+    try {  
+      // Validate and refresh the token 
+      console.log(`Attempting to get channels for user ${userId} and server ${serverId}`); 
+      const isValid = await this.validateAndRefreshToken(userId);  
+      if (!isValid) {  
+        throw new Error('Failed to validate Discord token');  
+      }  
+  
+      // Get the latest token after validation  
+      const latestToken = await this.getLatestToken(userId);  
+  
+      // Fetch the account data with the latest token  
+      const { data: account } = await adminClient  
+        .from('accounts')  
+        .select('credentials, status, channels_config')  
+        .eq('user_id', userId)  
+        .eq('platform', 'discord')  
+        .single();  
+  
+      if (!account) {  
+        throw new Error('No Discord account found');  
+      }  
+  
+      if (account.status !== 'active') {  
+        throw new Error('Discord account is not active');  
+      }  
+  
+      if (account.channels_config?.[`server_${serverId}_channels`]?.length > 0) {  
+        console.log('Using cached channel data');  
+        return {  
+          status: 'success',  
+          data: account.channels_config[`server_${serverId}_channels`],  
+          meta: {  
+            total: account.channels_config[`server_${serverId}_channels`].length,  
+            hasMore: false,  
+            cached: true  
+          }  
+        };  
+      } else {  
+        // Fetch channel data from Discord API if no cached data is found  
+        const response = await fetch(`${DISCORD_API_URL}/guilds/${serverId}/channels`, {  
+          headers: {  
+            Authorization: `Bot ${process.env.DISCORD_BOT_TOKEN}`,
+            'Accept': 'application/json',
+            'Content-Type': 'application/json'
+          }  
+        });  
+
+        console.log("The response is:", response);
+        console.log("The latest token got while getChannels is:", latestToken);
+
+        if (!response.ok) {  
+          // Handle rate limiting  
+          if (response.status === 429) {  
+            const retryAfter = parseInt(response.headers.get('Retry-After') || '5', 10);  
+            const maxRetries = 3; // adjust this value as needed  
+            const retryCount = 0; // initialize retry count  
+            const backoffDelay = retryAfter * 1000; // initial delay  
+        
+            while (retryCount < maxRetries) {  
+              console.log(`Rate limited, retrying after ${backoffDelay / 1000} seconds`);  
+              await new Promise(resolve => setTimeout(resolve, backoffDelay));  
+              retryCount++;  
+              backoffDelay *= 2; // exponential backoff  
+        
+              // retry the request  
+              const retryResponse = await fetch(`${DISCORD_API_URL}/guilds/${serverId}/channels`, {  
+                headers: {  
+                  Authorization: `Bot ${process.env.DISCORD_BOT_TOKEN}`
+                }  
+              });  
+        
+              if (retryResponse.ok) {  
+                // if the retry is successful, return the response  
+                return {  
+                  status: 'success',  
+                  data: await retryResponse.json(),  
+                  meta: {  
+                    total: (await retryResponse.json()).length,  
+                    hasMore: false,  
+                    cached: false  
+                  }  
+                };  
+              } else if (retryResponse.status === 429) {  
+                // if the retry is still rate limited, continue to the next iteration  
+                continue;  
+              } else {  
+                // if the retry fails for any other reason, throw an error  
+                throw new Error(`Failed to fetch Discord channels: ${retryResponse.status}`);  
+              }  
+            }  
+        
+            // if all retries fail, throw an error  
+            throw new Error(`Failed to fetch Discord channels after ${maxRetries} retries`);  
+          } else {  
+            throw new Error(`Failed to fetch Discord channels: ${response.status}`);  
+          }  
         }
-      });
-
-      if (!response.ok) {
-        if (response.status === 401) {
-          await this.refreshToken(userId);
-          return this.getChannels(userId, serverId);
-        }
-
-        // Handle rate limiting
-        if (response.status === 429) {
-          const retryAfter = parseInt(response.headers.get('Retry-After') || '5', 10);
-          console.log(`Rate limited, retrying after ${retryAfter} seconds`);
-          await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
-          return this.getChannels(userId, serverId);
-        }
-
-        throw new Error('Failed to fetch Discord channels');
-      }
-
-      const channels = await response.json();
-
-      // Store channel information in channels_config
-      const updatedChannelsConfig = {
-        ...(account.channels_config || {}),
-        [`server_${serverId}_channels`]: channels.map(channel => ({
-          id: channel.id,
-          name: channel.name,
-          type: channel.type,
-          position: channel.position,
-          parent_id: channel.parent_id,
-          updated_at: new Date().toISOString()
-        }))
-      };
-
-      // Update account with channel information
-      await adminClient
-        .from('accounts')
-        .update({
-          channels_config: updatedChannelsConfig,
-          updated_at: new Date().toISOString()
-        })
-        .eq('user_id', userId)
-        .eq('platform', 'discord');
-
-      return channels;
-    } catch (error) {
-      console.error(`Error fetching Discord channels for ${userId}:`, error);
-      
-      // Try to return cached data from channels_config
-      try {
-        const { data: account } = await adminClient
-          .from('accounts')
-          .select('channels_config')
-          .eq('user_id', userId)
-          .eq('platform', 'discord')
-          .single();
-
-        if (account?.channels_config?.[`server_${serverId}_channels`]?.length > 0) {
-          console.log('Returning cached channel data');
-          return account.channels_config[`server_${serverId}_channels`];
-        }
-      } catch (cacheError) {
-        console.error('Cache retrieval failed:', cacheError);
-      }
-      
-      throw error;
-    }
+        
+        const channels = await response.json();  
+        // Cache the channel data for future use  
+        await adminClient  
+          .from('accounts')  
+          .update({  
+            id: account.id,  
+            channels_config: {  
+              ...account.channels_config,  
+              [`server_${serverId}_channels`]: channels  
+            }  
+          });  
+  
+        return {  
+          status: 'success',  
+          data: channels,  
+          meta: {  
+            total: channels.length,  
+            hasMore: false,  
+            cached: false  
+          }  
+        };  
+      }  
+    } catch (error) {  
+      console.error(`Error fetching Discord channels for ${userId}:`, error);  
+      throw {  
+        status: 'error',  
+        message: error.message,  
+        details: error.toString()  
+      };  
+    }  
   }
+
+
 
   async getDirectMessages(userId) {
     try {
@@ -461,7 +609,7 @@ class ConnectionManager {
     try {
         const { data: account } = await adminClient
             .from('accounts')
-            .select('credentials, status')
+            .select('credentials, status, platform_data')
             .eq('user_id', userId)
             .eq('platform', 'discord')
             .single();
@@ -496,7 +644,26 @@ class ConnectionManager {
             });
 
             if (response.status === 400 && errorData.error === 'invalid_grant') {
-                await this.disconnect(userId);
+                // Store error info in platform_data
+                const platformData = {
+                    ...(account.platform_data || {}),
+                    last_error: {
+                        code: 'invalid_grant',
+                        message: 'Discord connection expired. Please reconnect.',
+                        timestamp: new Date().toISOString()
+                    }
+                };
+
+                await adminClient
+                    .from('accounts')
+                    .update({
+                        status: 'inactive',
+                        updated_at: new Date().toISOString(),
+                        platform_data: platformData
+                    })
+                    .eq('user_id', userId)
+                    .eq('platform', 'discord');
+
                 throw new Error('Discord connection expired. Please reconnect.');
             }
 
@@ -516,13 +683,17 @@ class ConnectionManager {
                     token_type: tokenData.token_type,
                     scope: tokenData.scope,
                     expires_in: tokenData.expires_in,
-                    refreshed_at: now.toISOString(),
                     expires_at: new Date(now.getTime() + (tokenData.expires_in * 1000)).getTime(),
                     created_at: account.credentials.created_at || now.toISOString()
                 },
                 status: 'active',
                 updated_at: now.toISOString(),
-                last_token_refresh: now.toISOString()
+                last_token_refresh: now.toISOString(),
+                // Clear error from platform_data if it exists
+                platform_data: {
+                    ...(account.platform_data || {}),
+                    last_error: null
+                }
             })
             .eq('user_id', userId)
             .eq('platform', 'discord');
@@ -544,11 +715,25 @@ class ConnectionManager {
     }
   }
 
+  async updateLatestToken(userId, token) {  
+    try {  
+      await adminClient  
+        .from('accounts')  
+        .update({  
+          credentials: token  
+        })  
+        .eq('user_id', userId)  
+        .eq('platform', 'discord');  
+    } catch (error) {  
+      console.error('Error updating latest token:', error);  
+    }  
+  }
+
   async validateAndRefreshToken(userId) {
     try {
       const { data: account } = await adminClient
         .from('accounts')
-        .select('credentials, status')
+        .select('credentials, status, platform_data')
         .eq('user_id', userId)
         .eq('platform', 'discord')
         .single();
@@ -569,7 +754,9 @@ class ConnectionManager {
       // Always verify with Discord API first
       const verifyResponse = await fetch(`${DISCORD_API_URL}/users/@me`, {
         headers: {
-          Authorization: `Bearer ${latestToken.access_token}`
+          Authorization: `Bearer ${latestToken.access_token}`,
+          'Accept': 'application/json',
+          'Content-Type': 'application/json'
         }
       });
 
@@ -597,21 +784,38 @@ class ConnectionManager {
             .from('accounts')
             .update({
               status: 'active',
-              updated_at: new Date().toISOString()
+              updated_at: new Date().toISOString(),
+              credentials: refreshedToken,
+              platform_data: {
+                ...(account.platform_data || {}),
+                last_error: null
+              }
             })
             .eq('user_id', userId)
             .eq('platform', 'discord');
+
+          await this.updateLatestToken(userId, refreshedToken); 
 
           return true;
         } catch (error) {
           console.error('Token refresh failed:', error);
           
-          // Update account status to inactive
+          // Store error info in platform_data
+          const platformData = {
+              ...(account.platform_data || {}),
+              last_error: {
+                  code: error.message.includes('expired') ? 'token_expired' : 'token_invalid',
+                  message: error.message,
+                  timestamp: new Date().toISOString()
+              }
+          };
+          
           await adminClient
             .from('accounts')
             .update({
               status: 'inactive',
-              updated_at: new Date().toISOString()
+              updated_at: new Date().toISOString(),
+              platform_data: platformData
             })
             .eq('user_id', userId)
             .eq('platform', 'discord');
@@ -620,13 +824,17 @@ class ConnectionManager {
         }
       }
 
-      // Token is valid, ensure status is active
+      // Token is valid, ensure status is active and clear any errors
       if (account.status !== 'active') {
         await adminClient
           .from('accounts')
           .update({
             status: 'active',
-            updated_at: new Date().toISOString()
+            updated_at: new Date().toISOString(),
+            platform_data: {
+                ...(account.platform_data || {}),
+                last_error: null
+            }
           })
           .eq('user_id', userId)
           .eq('platform', 'discord');
@@ -750,9 +958,9 @@ class ConnectionManager {
       }
 
       // Get messages from Discord API
-      const response = await fetch(`${DISCORD_API_URL}/channels/${channelId}/messages?limit=50`, {
+      const response = await fetch(`${DISCORD_API_URL}/channels/${channelId}/messages?limit=100`, {
         headers: {
-          Authorization: `Bearer ${account.credentials.access_token}`
+          Authorization: `Bot ${process.env.DISCORD_BOT_TOKEN}`
         }
       });
 
@@ -765,6 +973,47 @@ class ConnectionManager {
       }
 
       const messages = await response.json();
+
+      // Get channel info to get server_id
+      const channelInfo = await this.getChannel(userId, channelId);
+      const serverId = channelInfo.guild_id;
+
+      // Store messages in database
+      const messagesToInsert = messages.map(msg => ({
+        id: msg.id,
+        channel_id: channelId,
+        server_id: serverId,
+        user_id: userId,
+        author: {
+          id: msg.author.id,
+          username: msg.author.username,
+          discriminator: msg.author.discriminator,
+          avatar: msg.author.avatar
+        },
+        content: msg.content,
+        timestamp: msg.timestamp,
+        attachments: msg.attachments,
+        embeds: msg.embeds,
+        metadata: {
+          type: msg.type,
+          pinned: msg.pinned,
+          tts: msg.tts,
+          mention_everyone: msg.mention_everyone
+        }
+      }));
+
+      // Upsert messages to handle duplicates
+      const { error: insertError } = await adminClient
+        .from('discord_messages')
+        .upsert(messagesToInsert, {
+          onConflict: 'id',
+          ignoreDuplicates: false
+        });
+
+      if (insertError) {
+        console.error('Error storing messages:', insertError);
+      }
+
       return messages;
     } catch (error) {
       console.error(`Error fetching Discord messages for ${userId}:`, error);
@@ -875,40 +1124,57 @@ class ConnectionManager {
     }
   }
 
-  async getServer(userId, serverId) {
-    try {
-      const { data: account } = await adminClient
-        .from('accounts')
-        .select('credentials')
-        .eq('user_id', userId)
-        .eq('platform', 'discord')
-        .single();
-
-      if (!account?.credentials?.access_token) {
-        throw new Error('No Discord access token found');
-      }
-
-      // Get server details from Discord API
-      const response = await fetch(`${DISCORD_API_URL}/guilds/${serverId}`, {
-        headers: {
-          Authorization: `Bearer ${account.credentials.access_token}`
-        }
-      });
-
-      if (!response.ok) {
-        if (response.status === 401) {
-          await this.refreshToken(userId);
-          return this.getServer(userId, serverId);
-        }
-        throw new Error('Failed to fetch Discord server');
-      }
-
-      const server = await response.json();
-      return server;
-  } catch (error) {
-      console.error(`Error fetching Discord server for ${userId}:`, error);
-      throw error;
-    }
+  async getServer(userId, serverId) {  
+    try {  
+      // Validate and refresh the token  
+      const isValid = await this.validateAndRefreshToken(userId);  
+      if (!isValid) {  
+        throw new Error('Failed to validate Discord token');  
+      }  
+  
+      // Get the latest token after validation  
+      const latestToken = await this.getLatestToken(userId);  
+  
+      // Get server details from Discord API  
+      const response = await fetch(`${DISCORD_API_URL}/guilds/${serverId}`, {  
+        headers: {  
+          Authorization: `Bearer ${latestToken.access_token}`,
+          'Accept': 'application/json',
+          'Content-Type': 'application/json'
+        }  
+      });  
+  
+      if (!response.ok) {  
+        if (response.status === 429) {  
+          // Handle rate limiting  
+          const retryAfter = parseInt(response.headers.get('Retry-After') || '5', 10);  
+          console.log(`Rate limited, retrying after ${retryAfter} seconds`);  
+          await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));  
+          return this.getServer(userId, serverId);  
+        } else if (response.status === 401) {  
+          // Token is invalid, try to refresh it  
+          await this.refreshToken(userId);  
+          return this.getServer(userId, serverId);  
+        } else {  
+          throw new Error(`Failed to fetch Discord server: ${response.status}`);  
+        }  
+      }  
+  
+      const server = await response.json();  
+  
+      // Cache the server details in the database  
+      await adminClient  
+        .from('accounts')  
+        .update({  
+          id: userId,  
+          server_details: server  
+        });  
+  
+      return server;  
+    } catch (error) {  
+      console.error(`Error fetching Discord server for ${userId}:`, error);  
+      throw error;  
+    }  
   }
 
   async generateReport(userId, serverId, channelIds) {
@@ -1062,7 +1328,7 @@ class ConnectionManager {
       // Get channel details from Discord API
       const response = await fetch(`${DISCORD_API_URL}/channels/${channelId}`, {
         headers: {
-          Authorization: `Bearer ${account.credentials.access_token}`
+          Authorization: `Bot ${process.env.DISCORD_BOT_TOKEN}`
         }
       });
 

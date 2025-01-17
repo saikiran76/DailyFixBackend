@@ -1,9 +1,12 @@
 import sdk from 'matrix-js-sdk';
 import { adminClient } from '../utils/supabase.js';
+import { matrixRoomService } from './matrixRoomService.js';
 
 export const initializeMatrixClient = async (credentials) => {
   let client = null;
   let authenticatedClient = null;
+  const MAX_DNS_RETRIES = 3;
+  const DNS_RETRY_DELAY = 2000;
 
   try {
     console.log('Initializing Matrix client with credentials:', {
@@ -13,11 +16,39 @@ export const initializeMatrixClient = async (credentials) => {
 
     // Create initial client for login with direct server URL
     const baseUrl = credentials.homeserver || process.env.MATRIX_HOMESERVER_URL;
+
+    // Try to resolve DNS first
+    for (let attempt = 0; attempt < MAX_DNS_RETRIES; attempt++) {
+      try {
+        if (attempt > 0) {
+          console.log(`DNS resolution attempt ${attempt + 1}/${MAX_DNS_RETRIES}`);
+          await new Promise(resolve => setTimeout(resolve, DNS_RETRY_DELAY * attempt));
+        }
+
+        // Test connection to homeserver
+        const response = await fetch(`${baseUrl}/_matrix/client/versions`);
+        if (!response.ok) {
+          throw new Error(`Server returned ${response.status}`);
+        }
+        break;
+      } catch (error) {
+        console.error(`DNS resolution attempt ${attempt + 1} failed:`, error);
+        if (attempt === MAX_DNS_RETRIES - 1) throw error;
+      }
+    }
+
     client = sdk.createClient({
       baseUrl,
-      // Disable validation since we're using direct URL
+      timeoutMs: 20000,
+      retryIf: (attempt, error) => {
+        console.log(`Matrix client retry attempt ${attempt}:`, error.message);
+        return attempt < 3 && (
+          error.name === 'ConnectionError' ||
+          error.errcode === 'M_LIMIT_EXCEEDED' ||
+          error.name === 'TimeoutError'
+        );
+      },
       validateCertificate: false,
-      // Skip .well-known lookup
       useAuthorizationHeader: true,
       apiVersion: "v1.6"
     });
@@ -69,6 +100,9 @@ export const initializeMatrixClient = async (credentials) => {
         }
       });
     });
+
+    // Set up room invite handler
+    await matrixRoomService.setupSyncHandler(loginResponse.user_id, authenticatedClient);
 
     console.log('Matrix client initialized successfully for user:', loginResponse.user_id);
 

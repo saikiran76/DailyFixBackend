@@ -1,5 +1,5 @@
 import express from 'express';
-import { authenticateToken } from '../middleware/auth.js';
+import { authenticateUser } from '../middleware/auth.js';
 import { 
   createMatrixMapping, 
   getMatrixMappings, 
@@ -8,7 +8,7 @@ import {
 import { initializeBridge } from '../services/matrixBridgeService.js';
 
 const router = express.Router();
-router.use(authenticateToken);
+router.use(authenticateUser);
 
 // Create new channel mapping
 router.post('/matrix', async (req, res) => {

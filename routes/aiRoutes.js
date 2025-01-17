@@ -1,9 +1,9 @@
 import express from 'express';
-import { authenticateToken } from '../middleware/auth.js';
+import { authenticateUser } from '../middleware/auth.js';
 import { voiceToText } from '../services/sttService.js';
 
 const router=express.Router();
-router.use(authenticateToken);
+router.use(authenticateUser);
 
 router.post('/voiceToText', async (req,res)=>{
   // Expect audio data in req.body.audio (base64 or similar)

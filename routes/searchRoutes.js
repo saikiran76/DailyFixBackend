@@ -1,12 +1,12 @@
 import express from 'express';
-import { authenticateToken } from '../middleware/auth.js';
+import { authenticateUser } from '../middleware/auth.js';
 import { searchMessages } from '../services/matrixService.js';
 
 const createSearchRouter = (client) => {
   const router = express.Router();
 
   // Search messages across rooms
-  router.get('/', authenticateToken, async (req, res) => {
+  router.get('/', authenticateUser, async (req, res) => {
     try {
       const { term, page = 1, limit = 10 } = req.query;
 
@@ -25,7 +25,7 @@ const createSearchRouter = (client) => {
   });
 
   // Search rooms
-  router.get('/rooms', authenticateToken, async (req, res) => {
+  router.get('/rooms', authenticateUser, async (req, res) => {
     try {
       const rooms = client.getRooms();
       const roomList = rooms.map(room => ({
@@ -46,7 +46,7 @@ const createSearchRouter = (client) => {
   });
 
   // Search users in a room
-  router.get('/room/:roomId/users', authenticateToken, async (req, res) => {
+  router.get('/room/:roomId/users', authenticateUser, async (req, res) => {
     try {
       const { roomId } = req.params;
       const room = client.getRoom(roomId);
@@ -71,7 +71,7 @@ const createSearchRouter = (client) => {
   });
 
   // Get room messages with pagination
-  router.get('/room/:roomId/messages', authenticateToken, async (req, res) => {
+  router.get('/room/:roomId/messages', authenticateUser, async (req, res) => {
     try {
       const { roomId } = req.params;
       const { limit = 50, before } = req.query;

@@ -1,11 +1,11 @@
 import express from 'express';
-import authMiddleware from '../middleware/authMiddleware.js';
-import { supabase, adminClient } from '../utils/supabase.js';
+import { authenticateUser } from '../middleware/auth.js';
+import { adminClient } from '../utils/supabase.js';
 
 const router = express.Router();
-router.use(authMiddleware);
 
-// Get user onboarding status
+router.use(authenticateUser);
+
 router.get('/onboarding-status', async (req, res) => {
   try {
     const userId = req.user.id;
@@ -50,65 +50,94 @@ router.get('/onboarding-status', async (req, res) => {
   }
 });
 
-// Update user onboarding status
+// Update onboarding status (to match frontend's endpoint)
 router.post('/onboarding-status', async (req, res) => {
   try {
     const userId = req.user.id;
+    console.log('Updating onboarding status for user:', userId);
     const { currentStep } = req.body;
 
-    console.log('Updating onboarding status:', { userId, currentStep });
+    // Validate step transition
+    const validSteps = ['welcome', 'protocol_selection', 'matrix_setup', 'whatsapp_setup', 'complete'];
+    if (!validSteps.includes(currentStep)) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'Invalid onboarding step'
+      });
+    }
 
-    // First, check if a record exists
-    const { data: existingRecord, error: checkError } = await adminClient
+    // Update or insert onboarding status
+    const { data: updateData, error: updateError } = await adminClient
+      .from('user_onboarding')
+      .upsert({
+        user_id: userId,
+        current_step: currentStep,
+        is_complete: currentStep === 'complete',
+        updated_at: new Date().toISOString()
+      }, {
+        onConflict: 'user_id',
+        returning: 'minimal'
+      });
+
+    if (updateError) {
+      console.error('Error updating onboarding status:', updateError);
+      throw updateError;
+    }
+
+    // Get updated status
+    const { data: currentStatus, error: getError } = await adminClient
       .from('user_onboarding')
       .select('*')
       .eq('user_id', userId)
       .single();
 
-    if (checkError && checkError.code !== 'PGRST116') { // PGRST116 means not found
-      console.error('Error checking existing record:', checkError);
-      throw checkError;
+    if (getError) {
+      console.error('Error fetching updated status:', getError);
+      throw getError;
     }
 
-    let result;
-    if (existingRecord) {
-      // Update existing record
-      result = await adminClient
-        .from('user_onboarding')
-        .update({
-          current_step: currentStep,
-          is_complete: currentStep === 'completion',
-          updated_at: new Date().toISOString()
-        })
-        .eq('user_id', userId);
-    } else {
-      // Insert new record
-      result = await adminClient
-        .from('user_onboarding')
-        .insert({
-          user_id: userId,
-          current_step: currentStep,
-          is_complete: currentStep === 'completion',
-          updated_at: new Date().toISOString()
-        });
-    }
-
-    if (result.error) {
-      console.error('Error updating/inserting onboarding status:', result.error);
-      throw result.error;
-    }
-
-    console.log('Successfully updated onboarding status');
-    res.json({ 
-      success: true,
+    console.log('Onboarding status updated successfully:', {
+      userId,
       currentStep,
-      isComplete: currentStep === 'completion'
+      isComplete: currentStep === 'complete'
+    });
+
+    res.json({
+      status: 'success',
+      data: currentStatus
     });
   } catch (error) {
-    console.error('Error updating onboarding status:', error);
-    res.status(500).json({ 
-      error: 'Failed to update onboarding status',
-      details: error.message 
+    console.error('Error in onboarding status update:', error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to update onboarding status',
+      error: error.message
+    });
+  }
+});
+
+// Get user profile
+router.get('/profile', async (req, res) => {
+  try {
+    const userId = req.user.id;
+    
+    const { data, error } = await adminClient
+      .from('profiles')
+      .select('*')
+      .eq('id', userId)
+      .single();
+
+    if (error) throw error;
+
+    res.json({
+      status: 'success',
+      data
+    });
+  } catch (error) {
+    console.error('Error fetching user profile:', error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to fetch user profile'
     });
   }
 });

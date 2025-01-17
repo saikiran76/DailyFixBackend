@@ -1,4 +1,4 @@
-import { adminClient } from '../utils/supabase.js';
+import { supabase } from '../utils/supabase.js';
 
 export default async function authMiddleware(req, res, next) {
   try {
@@ -13,7 +13,7 @@ export default async function authMiddleware(req, res, next) {
     console.log('Validating token...');
     
     // Verify the token using admin client
-    const { data: { user }, error: adminError } = await adminClient.auth.getUser(token);
+    const { data: { user }, error: adminError } = await supabase.auth.getUser(token);
     
     if (adminError || !user) {
       console.error('Token validation error:', adminError);

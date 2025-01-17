@@ -1,5 +1,5 @@
 import express from 'express';
-import { authenticateToken } from '../middleware/auth.js';
+import { authenticateUser } from '../middleware/auth.js';
 // import { 
 //   initializeDiscordClient, 
 //   getDiscordClient 
@@ -9,7 +9,7 @@ import Message from '../models/Message.js';
 const router = express.Router();
 
 // Get all Discord channels
-router.get('/channels', authenticateToken, async (req, res) => {
+router.get('/channels', authenticateUser, async (req, res) => {
   try {
     const client = req.app.locals.discordClient;
     const channels = client.channels.cache
@@ -31,7 +31,7 @@ router.get('/channels', authenticateToken, async (req, res) => {
 });
 
 // Get messages for a specific Discord channel
-router.get('/channels/:channelId/messages', authenticateToken, async (req, res) => {
+router.get('/channels/:channelId/messages', authenticateUser, async (req, res) => {
   try {
     const { channelId } = req.params;
     const { limit = 50 } = req.query;
@@ -62,7 +62,7 @@ router.get('/channels/:channelId/messages', authenticateToken, async (req, res) 
 });
 
 // Send a message to a Discord channel
-router.post('/channels/:channelId/messages', authenticateToken, async (req, res) => {
+router.post('/channels/:channelId/messages', authenticateUser, async (req, res) => {
   try {
     const { channelId } = req.params;
     const { content, priority } = req.body;
@@ -108,7 +108,7 @@ router.post('/channels/:channelId/messages', authenticateToken, async (req, res)
 });
 
 // Get Discord channel summary
-router.get('/channels/:channelId/summary', authenticateToken, async (req, res) => {
+router.get('/channels/:channelId/summary', authenticateUser, async (req, res) => {
   try {
     const { channelId } = req.params;
     const client = req.app.locals.discordClient;
