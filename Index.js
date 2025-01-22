@@ -4,31 +4,46 @@ import http from 'http';
 import { createClient } from '@supabase/supabase-js';
 import cookieParser from 'cookie-parser';
 import session from 'express-session';
-import { Server } from 'socket.io';
 import dotenv from 'dotenv';
+import helmet from 'helmet';
+import compression from 'compression';
+
+// Import logger first as it's used by other services
+import logger from './utils/logger.js';
+
+// Import configuration
+import { config } from './config/config.js';
+import { redisClient } from './services/redisService.js';
+
+// Import core services
+import { databaseService } from './services/databaseService.js';
+import { rateLimiterService } from './services/rateLimiterService.js';
+import { initializeSocketServer } from './services/socketService.js';
 import { setIO } from './utils/socket.js';
 
+// Import initialization services
 import { initializeMatrixClient } from './services/matrixService.js';
-import { initializePlatformBridge } from './services/matrixBridgeService.js';
-import connectRoutes from './routes/connectRoutes.js';
-import matrixRoomRoutes from './routes/matrixRoomRoutes.js';
-import { bridges } from './services/matrixBridgeService.js';
-import { errorHandler } from './middleware/errorHandler.js';
+import { initializePlatformBridge, bridges } from './services/matrixBridgeService.js';
 import { checkSystemHealth } from './services/healthCheck.js';
-import {createTables} from './utils/supabase.js';
+import { createTables } from './utils/supabase.js';
+import { syncJobService } from './services/syncJobService.js';
+import { tokenService } from './services/tokenService.js';
+import { startWhatsAppSyncJob } from './services/whatsappEntityService.js';
+
+// Import middleware
+import { requestHandler, errorHandler } from './middleware/requestHandler.js';
+
+// Import routes
 import authRoutes from './routes/authRoutes.js';
-import accountRoutes from './routes/accountsRoutes.js';
-import platformRoutes from './routes/platformRoutes.js';
-import bridgeRoutes from './routes/bridgeRoutes.js';
-import { initializeSocketServer } from './services/socketService.js';
+import accountsRoutes from './routes/accountsRoutes.js';
 import userRoutes from './routes/userRoutes.js';
 import onboardingRoutes from './routes/onboardingRoutes.js';
-import adminRoutes from './routes/adminRoutes.js';
-import reportRoutes from './routes/reportRoutes.js';
+import connectRoutes from './routes/connectRoutes.js';
+import platformRoutes from './routes/platformRoutes.js';
+import bridgeRoutes from './routes/bridgeRoutes.js';
 import matrixRoutes from './routes/matrixRoutes.js';
 import whatsappEntityRoutes from './routes/whatsappEntityRoutes.js';
 import aiAnalysisRoutes from './routes/aiAnalysis.js';
-import { syncJobService } from './services/syncJobService.js';
 
 dotenv.config();
 
@@ -40,24 +55,80 @@ const supabase = createClient(
   process.env.SUPABASE_ANON_KEY
 );
 
+// Define cleanup function at the top level
+const cleanup = async () => {
+  logger.info('Starting cleanup...');
+  try {
+    await Promise.all([
+      redisClient.disconnect(),
+      databaseService.cleanup()
+    ]);
+    logger.info('Cleanup completed');
+    process.exit(0);
+  } catch (error) {
+    logger.error('Error during cleanup:', error);
+    process.exit(1);
+  }
+};
+
+// Global error handlers
+process.on('unhandledRejection', (reason, promise) => {
+  logger.error('Unhandled Rejection at:', {
+    promise: promise,
+    reason: reason,
+    stack: reason?.stack
+  });
+  // Don't exit, let the process continue
+});
+
+process.on('uncaughtException', (error) => {
+  logger.error('Uncaught Exception:', {
+    error: error,
+    stack: error?.stack
+  });
+  // Initiate graceful shutdown
+  cleanup().catch(err => {
+    logger.error('Cleanup failed during uncaught exception handler:', err);
+  }).finally(() => {
+    process.exit(1);
+  });
+});
+
+// Initialize Express app
 const app = express();
 
-// Configure CORS first
+// Apply security middleware
+app.use(helmet());
+app.use(compression());
+
+// Configure CORS
 app.use(cors({
   origin: process.env.FRONTEND_URL || 'http://localhost:5173',
-  credentials: true
+  credentials: true,
+  methods: ['GET', 'POST'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  exposedHeaders: ['Content-Range', 'X-Content-Range']
 }));
 
-// Then add other middleware
+// Apply basic middleware
 app.use(express.json());
 app.use(cookieParser());
 
-// Configure session middleware with proper settings
+// Configure session with Redis
+import RedisStore from 'connect-redis';
+
+// Initialize Redis before setting up session
+await redisClient.connect();
+
 app.use(session({
+  store: new RedisStore({ 
+    client: redisClient.client, // Use the client property directly
+    prefix: 'sess:'
+  }),
   secret: process.env.SESSION_SECRET || 'your-secret-key',
   resave: false,
   saveUninitialized: false,
-  name: 'discord.oauth.sid', // Unique name to avoid conflicts
+  name: 'dailyfix.sid',
   cookie: {
     secure: process.env.NODE_ENV === 'production',
     httpOnly: true,
@@ -66,37 +137,86 @@ app.use(session({
   }
 }));
 
-// Log session middleware initialization
-console.log('Session middleware initialized with settings:', {
-  cookieSecure: process.env.NODE_ENV === 'production',
-  sessionSecret: process.env.SESSION_SECRET ? 'set' : 'using fallback',
-  timestamp: new Date().toISOString()
-});
+// Apply custom middleware
+app.use(requestHandler);
 
 const server = http.createServer(app);
 
-// Initialize socket.io with the server
-const io = initializeSocketServer(server);
+// Health check endpoint
+app.get('/health', async (req, res) => {
+  try {
+    const dbHealth = await databaseService.healthCheck();
+    const status = {
+      service: 'dailyfix-backend',
+      status: 'healthy',
+      timestamp: new Date().toISOString(),
+      redis: {
+        connected: await redisClient.ping(),
+        lastCheck: new Date().toISOString()
+      },
+      database: {
+        connected: dbHealth.healthy,
+        lastCheck: new Date().toISOString(),
+        poolStats: {
+          size: dbHealth.poolSize,
+          waiting: dbHealth.waiting,
+          idle: dbHealth.idle
+        }
+      },
+      tokenService: {
+        valid: false,
+        status: 'initializing',
+        lastCheck: new Date().toISOString()
+      },
+      bridges: {}
+    };
 
-// Make io available to routes and set in socket utility
-app.set('io', io);
-setIO(io);
+    res.json(status);
+  } catch (error) {
+    logger.error('Health check failed:', error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Health check failed',
+      timestamp: new Date().toISOString()
+    });
+  }
+});
 
-// Initialize Matrix clients and bridges
+// Initialize core services
 async function initializeServices() {
   try {
-    // Verify database connection first
-    const { data, error: dbError } = await supabase
-      .from('accounts')
-      .select('count')
-      .limit(1);
+    logger.info('Initializing core services...');
 
-    if (dbError) {
-      console.error('Database connection error:', dbError);
-      throw dbError;
+    // Initialize Redis
+    await redisClient.connect();
+    logger.info('Redis service initialized');
+
+    // Initialize token service and verify it has a valid session
+    const tokenData = await tokenService.getValidToken();
+    if (!tokenData) {
+      logger.warn('Token service initialized without active session');
+    } else {
+      logger.info('Token service initialized with valid session');
     }
 
-    // Get active Matrix accounts from Supabase
+    // Initialize Socket.IO with Redis adapter
+    const io = await initializeSocketServer(server);
+    logger.info('Socket.IO service initialized');
+
+    // Verify database connection
+    const dbHealth = await databaseService.healthCheck();
+    if (!dbHealth.healthy) {
+      throw new Error('Database health check failed');
+    }
+    logger.info('Database connection verified');
+
+    // Initialize database tables
+    console.log('Initializing database tables...');
+    await databaseService.initializeTables();
+    console.log('Database initialization completed successfully');
+    logger.info('Database tables initialized');
+
+    // Initialize Matrix clients and bridges
     const { data: matrixAccounts, error } = await supabase
       .from('accounts')
       .select('*')
@@ -105,161 +225,81 @@ async function initializeServices() {
 
     if (error) throw error;
     
-    if (!matrixAccounts || matrixAccounts.length === 0) {
-      console.log('No active Matrix accounts found');
-      return;
-    }
-
-    for (const account of matrixAccounts) {
-      await initializeMatrixClient(account.credentials.accessToken);
-      
-      // Get connected platforms
-      const { data: connectedPlatforms, error: platformError } = await supabase
-        .from('accounts')
-        .select('*')
-        .eq('user_id', account.user_id)
-        .eq('status', 'active')
-        .in('platform', ['whatsapp', 'telegram']);
-
-      if (platformError) throw platformError;
-
-      for (const platformAccount of connectedPlatforms) {
-        await initializePlatformBridge(account.user_id, platformAccount.platform);
+    if (matrixAccounts && matrixAccounts.length > 0) {
+      for (const account of matrixAccounts) {
+        const { credentials } = account;
+        await initializeMatrixClient(credentials.accessToken, credentials.userId);
+        logger.info(`Matrix client initialized for user: ${account.user_id}`);
       }
     }
 
-    // Initialize WhatsApp sync job service
-    console.log('Initializing WhatsApp sync job service...');
-    await syncJobService.start();
-    console.log('WhatsApp sync job service initialized successfully');
+    // Start WhatsApp sync job service
+    console.log('Starting WhatsApp sync job service');
+    await startWhatsAppSyncJob();
+    logger.info('WhatsApp sync job service initialized');
 
-  } catch (error) {
-    console.error('Matrix/Bridge/Sync initialization error:', error);
-    throw error; // Propagate error for recovery mechanism
-  }
-}
-
-// Add cleanup function
-async function cleanup() {
-  console.log('Cleaning up before shutdown...');
-  
-  try {
-    // Cleanup all bridges
-    for (const [key, bridge] of bridges.entries()) {
-      await bridge.cleanup();
-    }
-    
-    // Close any active realtime subscriptions
-    const subscriptions = supabase.getSubscriptions();
-    if (subscriptions && subscriptions.length > 0) {
-      subscriptions.forEach(subscription => {
-        supabase.removeSubscription(subscription);
+    // Start server
+    server.listen(port, () => {
+      logger.info(`Server running on port ${port}`);
+      
+      // 5. Emit server ready event
+      io.emit('system:status', {
+        type: 'server',
+        status: 'ready',
+        timestamp: new Date().toISOString()
       });
-    }
-    
-    console.log('Cleanup completed');
-    process.exit(0);
+    });
+
+    // Set up cleanup on process exit
+    process.on('SIGTERM', cleanup);
+    process.on('SIGINT', cleanup);
+
+    // Schedule periodic health checks
+    const healthCheckInterval = setInterval(async () => {
+      try {
+        const health = await checkSystemHealth();
+        if (!health.healthy) {
+          logger.warn('System health check failed:', health);
+        }
+      } catch (error) {
+        logger.error('Health check error:', error);
+      }
+    }, 30000).unref(); // Don't prevent process exit
+
+    // Cleanup health check on shutdown
+    const cleanupHealthCheck = () => {
+      clearInterval(healthCheckInterval);
+    };
+    process.on('SIGTERM', cleanupHealthCheck);
+    process.on('SIGINT', cleanupHealthCheck);
+
   } catch (error) {
-    console.error('Cleanup error:', error);
+    logger.error('Failed to initialize services:', error);
+    await cleanup();
     process.exit(1);
   }
 }
 
-// Add signal handlers
-process.on('SIGTERM', cleanup);
-process.on('SIGINT', cleanup);
-
-// Add health check endpoint
-app.get('/health', async (req, res) => {
-  const health = await checkSystemHealth();
-  const status = health.database && Object.values(health.bridges)
-    .every(bridge => bridge.connected) ? 200 : 503;
-  res.status(status).json(health);
-});
-
-// Add global error handler
-app.use(errorHandler);
-
-// Add recovery mechanism
-async function attemptRecovery() {
-  console.log('Attempting system recovery...');
-  try {
-    await initializeServices();
-    console.log('Recovery successful');
-  } catch (error) {
-    console.error('Recovery failed:', error);
-    // Retry after delay
-    setTimeout(attemptRecovery, 5000);
-  }
-}
-
-// Initialize database and start server
-async function initializeDatabase() {
-  try {
-    // Initialize Supabase tables
-    await createTables();
-    console.log('Database initialized successfully');
-  } catch (error) {
-    console.error('Database initialization failed:', error);
-    throw error;
-  }
-}
-
-// Add routes in order of specificity
-// Authentication routes first
+// Add routes
 app.use('/auth', authRoutes);
-
-// Platform-specific routes
 app.use('/matrix', matrixRoutes);
 app.use('/api/whatsapp-entities', whatsappEntityRoutes);
-app.use('/api/analysis', aiAnalysisRoutes);
-
-// General platform and connection routes
 app.use('/connect', connectRoutes);
 app.use('/platforms', platformRoutes);
 app.use('/bridge', bridgeRoutes);
-
-// User and account management routes
-app.use('/accounts', accountRoutes);
+app.use('/accounts', accountsRoutes);
 app.use('/user', userRoutes);
 app.use('/onboarding', onboardingRoutes);
-
-// Administrative routes
-app.use('/admin', adminRoutes);
-app.use('/reports', reportRoutes);
-
-// Global error handler should be last
-app.use(errorHandler);
-
-// Register AI Analysis routes
 app.use('/api/analysis', aiAnalysisRoutes);
 
-// Start server only after database is initialized
-async function startServer() {
-  try {
-    // Initialize database first
-    await initializeDatabase();
-    
-    // Then initialize services
-    await initializeServices();
-    
-    // Finally start the server
-    server.listen(port, () => {
-      console.log(`Server running on port ${port}`);
-    });
-  } catch (error) {
-    console.error('Server startup failed:', error);
-    // Add retry mechanism
-    if (error.message.includes('Table verification failed')) {
-      console.log('Retrying database initialization in 5 seconds...');
-      setTimeout(startServer, 5000);
-    } else {
-      process.exit(1);
-    }
-  }
-}
+// Add error handler last
+app.use(errorHandler);
 
-startServer();
+// Start the application
+initializeServices().catch(error => {
+  logger.error('Application startup failed:', error);
+  process.exit(1);
+});
 
 // Export supabase client for use in other files
 export { supabase };

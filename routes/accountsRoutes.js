@@ -1,7 +1,7 @@
 import express from 'express';
 import { authenticateUser } from '../middleware/auth.js';
 import { supabase, adminClient } from '../utils/supabase.js';
-import { getMatrixMessages } from '../services/matrixService.js';
+import { matrixService } from '../services/matrixService.js';
 import telegramService from '../services/telegramService.js';
 
 const router = express.Router();
@@ -69,7 +69,7 @@ router.get('/inbox', authenticateUser, async (req, res) => {
         switch (account.platform) {
           case 'matrix':
             console.log('Fetching Matrix messages for account:', account.id);
-            const matrixMessages = await getMatrixMessages(account);
+            const matrixMessages = await matrixService.getMatrixMessages(account);
             messages.push(...matrixMessages);
             break;
           case 'telegram':
@@ -144,7 +144,7 @@ router.get('/messages', authenticateUser, async (req, res) => {
         switch (account.platform) {
           case 'matrix':
             console.log('Fetching Matrix messages for account:', account.id);
-            const matrixMessages = await getMatrixMessages(account);
+            const matrixMessages = await matrixService.getMatrixMessages(account);
             messages.push(...matrixMessages);
             break;
           case 'telegram':

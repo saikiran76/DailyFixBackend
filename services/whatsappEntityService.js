@@ -1,8 +1,27 @@
 import { adminClient } from '../utils/supabase.js';
-import { matrixWhatsAppService }  from './matrixWhatsAppService.js';
+import { matrixWhatsAppService } from './matrixWhatsAppService.js';
 import { BRIDGE_CONFIGS } from '../config/bridgeConfig.js';
 import * as sdk from 'matrix-js-sdk';
 import { getIO } from '../utils/socket.js';
+import { createClient } from 'redis';
+import { redisConfig } from '../config/redis.js';
+import { redisClient } from './redisService.js';
+import { logger } from '../utils/logger.js';
+
+const pubClient = createClient(redisConfig);
+await pubClient.connect();
+
+const CACHE_KEYS = {
+  CONTACTS: (userId) => `whatsapp:${userId}:contacts`,
+  MESSAGES: (userId, contactId) => `whatsapp:${userId}:messages:${contactId}`,
+  PRIORITIES: (userId, contactId) => `whatsapp:${userId}:priorities:${contactId}`
+};
+
+const CACHE_TTL = {
+  CONTACTS: 300, // 5 minutes
+  MESSAGES: 600, // 10 minutes
+  PRIORITIES: 1800 // 30 minutes
+};
 
 // Helper function to extract WhatsApp ID from room data
 // function extractWhatsAppId(roomData) {
@@ -57,6 +76,43 @@ class WhatsAppEntityService {
     this.extractWhatsAppId = this.extractWhatsAppId.bind(this);
     this.initialSyncComplete = new Map(); // Track if initial sync is done for each user
     this.bridgeBotUserId = process.env.BRIDGE_BOT_USER_ID;
+    this.lockTimeouts = new Map();
+    this.LOCK_TIMEOUT = 5 * 60 * 1000; // 5 minutes
+    this.lockPromises = new Map();
+    this.contactSyncTimes = new Map();
+
+    // Enhanced sync status constants
+    this.SYNC_STATES = {
+      PENDING: 'pending',
+      APPROVED: 'approved',
+      REJECTED: 'rejected'
+    };
+  }
+
+  // Helper to clear lock and timeout
+  _clearLock(lockKey) {
+    this.syncLocks.delete(lockKey);
+    const timeoutId = this.lockTimeouts.get(lockKey);
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+      this.lockTimeouts.delete(lockKey);
+    }
+  }
+
+  // Helper to set lock with timeout
+  _setLock(lockKey) {
+    if (this.syncLocks.get(lockKey)) {
+      return false;
+    }
+
+    this.syncLocks.set(lockKey, true);
+    const timeoutId = setTimeout(() => {
+      console.log(`[WhatsApp Service] Lock timeout for ${lockKey}`);
+      this._clearLock(lockKey);
+    }, this.LOCK_TIMEOUT);
+    
+    this.lockTimeouts.set(lockKey, timeoutId);
+    return true;
   }
 
   extractWhatsAppId(roomData) {
@@ -275,132 +331,319 @@ class WhatsAppEntityService {
     }
   }
 
-  async getContacts(userId, forceSync = false) {
-    const lockKey = `contacts-${userId}`;
-    if (this.syncLocks.get(lockKey)) {
-      console.log('[WhatsApp Service] Sync already in progress for user:', userId);
-      return this.getCachedContacts(userId);
+  async acquireLock(lockKey) {
+    while (this.syncLocks.get(lockKey)) {
+      // Wait for existing lock to be released
+      await new Promise(resolve => {
+        const currentPromise = this.lockPromises.get(lockKey) || Promise.resolve();
+        this.lockPromises.set(lockKey, currentPromise.then(resolve));
+      });
     }
+    this.syncLocks.set(lockKey, true);
+  }
 
-    try {
-      // Check if initial sync is already done and not forcing
-      if (!forceSync && this.initialSyncComplete.get(userId)) {
-        return this.getCachedContacts(userId);
-      }
-
-      this.syncLocks.set(lockKey, true);
-      console.log('[WhatsApp Service] Starting contact sync for user:', userId);
-
-      // Get Matrix client with initialization
-      const matrixClient = await this.getMatrixClient(userId);
-      if (!matrixClient) {
-        console.error('[WhatsApp Service] Failed to initialize Matrix client');
-        return this.getCachedContacts(userId);
-      }
-
-      // Use a reasonable timeout (2 minutes)
-      const syncTimeout = 2 * 60 * 1000;
-      const syncResult = await Promise.race([
-        this.syncContacts(userId, matrixClient),
-        new Promise((_, reject) => 
-          setTimeout(() => reject(new Error('Contact sync timeout')), syncTimeout)
-        )
-      ]);
-
-      // Mark sync as complete only on success
-      this.initialSyncComplete.set(userId, true);
-      return syncResult;
-    } catch (error) {
-      console.error('[WhatsApp Service] Error in getContacts:', error);
-      // On error, clear sync complete flag to allow retry
-      this.initialSyncComplete.delete(userId);
-      // Return cached contacts on error
-      return this.getCachedContacts(userId);
-    } finally {
-      this.syncLocks.delete(lockKey);
+  releaseLock(lockKey) {
+    this.syncLocks.delete(lockKey);
+    const promise = this.lockPromises.get(lockKey);
+    if (promise) {
+      promise.then(() => this.lockPromises.delete(lockKey));
     }
   }
 
-  async getCachedContacts(userId) {
-    console.log('[WhatsApp Service] Using cached contacts for user:', userId);
-    const { data: contacts, error } = await adminClient
-      .from('whatsapp_contacts')
-      .select('*')
-      .eq('user_id', userId)
-      .order('last_message_at', { ascending: false });
-
-    if (error) throw error;
-    return contacts || [];
-  }
-
-  async syncContacts(userId, matrixClient) {
+  async getContacts(userId, options = { forceSync: false }) {
     try {
-      // Get all rooms
-      const rooms = matrixClient.getRooms();
-      console.log(`[WhatsApp Service] Found ${rooms.length} rooms`);
-
-      // Get existing contacts
-      const { data: existingContacts } = await adminClient
-        .from('whatsapp_contacts')
-        .select('*')
-        .eq('user_id', userId);
-
-      const contactMap = new Map(existingContacts?.map(c => [c.whatsapp_id, c]) || []);
-      const updatedContacts = [];
-
-      // Process each room
-      for (const room of rooms) {
-        try {
-          const whatsappId = this.extractWhatsAppId({
-            name: room.name,
-            topic: room.topic,
-            state_events: room.currentState.getStateEvents('uk.half-shot.bridge'),
-            is_group: room.getJoinedMembers().length > 2
-          });
-
-          if (!whatsappId) continue;
-
-          const contactData = {
-            user_id: userId,
-            whatsapp_id: whatsappId,
-            display_name: room.name,
-            metadata: {
-              room_id: room.roomId,
-              member_count: room.getJoinedMembers().length
-            },
-            last_message_at: new Date().toISOString()
-          };
-
-          const existing = contactMap.get(whatsappId);
-          if (existing) {
-            // Update existing contact
-            const { error } = await adminClient
-              .from('whatsapp_contacts')
-              .update(contactData)
-              .eq('id', existing.id);
-
-            if (!error) updatedContacts.push({ ...existing, ...contactData });
-          } else {
-            // Insert new contact
-            const { data, error } = await adminClient
-              .from('whatsapp_contacts')
-              .insert(contactData)
-              .select()
-              .single();
-
-            if (!error) updatedContacts.push(data);
-          }
-        } catch (roomError) {
-          console.error('[WhatsApp Service] Error processing room:', roomError);
-          // Continue with other rooms
+      // Try cache first if not forcing sync
+      if (!options.forceSync) {
+        const cached = await redisClient.get(CACHE_KEYS.CONTACTS(userId));
+        if (cached) {
+          return JSON.parse(cached);
         }
       }
 
-      return updatedContacts;
+      // Get from database
+      const { data: dbContacts, error: dbError } = await adminClient
+        .from('whatsapp_contacts')
+        .select('*')
+        .eq('user_id', userId)
+        .order('updated_at', { ascending: false });
+
+      if (dbError) throw dbError;
+
+      // Start background sync if forced or no contacts
+      if (options.forceSync || !dbContacts.length) {
+        this.syncContacts(userId);
+      }
+
+      // Cache results
+      await redisClient.set(
+        CACHE_KEYS.CONTACTS(userId),
+        JSON.stringify(dbContacts),
+        'EX',
+        CACHE_TTL.CONTACTS
+      );
+
+      return dbContacts;
     } catch (error) {
-      console.error('[WhatsApp Service] Error in syncContacts:', error);
+      logger.error('[WhatsApp Entity] Error fetching contacts:', error);
       throw error;
     }
+  }
+
+  async syncContacts(userId) {
+    try {
+      // Get Matrix client
+      const client = await matrixWhatsAppService.getMatrixClient(userId);
+      if (!client) {
+        throw new Error('Matrix client not initialized');
+      }
+
+      // Get bridge room
+      const bridgeRoom = await matrixWhatsAppService.getBridgeRoom(userId);
+      if (!bridgeRoom) {
+        throw new Error('Bridge room not found');
+      }
+
+      // Start sync process
+      await matrixWhatsAppService.syncMessages(userId, bridgeRoom.roomId, {
+        type: 'contacts',
+        fullSync: true
+      });
+
+      return true;
+    } catch (error) {
+      logger.error('[WhatsApp Entity] Error syncing contacts:', error);
+      throw error;
+    }
+  }
+
+  async getMessages(userId, contactId, options = { limit: 50, before: null }) {
+    try {
+      // Try cache first
+      const cacheKey = CACHE_KEYS.MESSAGES(userId, contactId);
+      const cached = await redisClient.get(cacheKey);
+      
+      if (cached) {
+        const messages = JSON.parse(cached);
+        // Filter based on options
+        return messages.filter(msg => 
+          (!options.before || msg.timestamp < options.before)
+        ).slice(0, options.limit);
+      }
+
+      // Get from database
+      const { data: messages, error } = await adminClient
+        .from('whatsapp_messages')
+        .select('*')
+        .eq('user_id', userId)
+        .eq('contact_id', contactId)
+        .order('timestamp', { ascending: false })
+        .limit(options.limit);
+
+      if (error) throw error;
+
+      // Cache results
+      await redisClient.set(
+        cacheKey,
+        JSON.stringify(messages),
+        'EX',
+        CACHE_TTL.MESSAGES
+      );
+
+      // Start background sync
+      this.syncMessages(userId, contactId);
+
+      return messages;
+    } catch (error) {
+      logger.error('[WhatsApp Entity] Error fetching messages:', error);
+      throw error;
+    }
+  }
+
+  async syncMessages(userId, contactId) {
+    try {
+      await matrixWhatsAppService.syncMessages(userId, contactId, {
+        type: 'messages',
+        fullSync: false
+      });
+      return true;
+    } catch (error) {
+      logger.error('[WhatsApp Entity] Error syncing messages:', error);
+      throw error;
+    }
+  }
+
+  async getPriorities(userId, contactId) {
+    try {
+      // Try cache first
+      const cacheKey = CACHE_KEYS.PRIORITIES(userId, contactId);
+      const cached = await redisClient.get(cacheKey);
+      
+      if (cached) {
+        return JSON.parse(cached);
+      }
+
+      // Get from database
+      const { data: priorities, error } = await adminClient
+        .from('whatsapp_priorities')
+        .select('*')
+        .eq('user_id', userId)
+        .eq('contact_id', contactId)
+        .order('created_at', { ascending: false });
+
+      if (error) throw error;
+
+      // Cache results
+      await redisClient.set(
+        cacheKey,
+        JSON.stringify(priorities),
+        'EX',
+        CACHE_TTL.PRIORITIES
+      );
+
+      return priorities;
+    } catch (error) {
+      logger.error('[WhatsApp Entity] Error fetching priorities:', error);
+      throw error;
+    }
+  }
+
+  // Cache invalidation methods
+  async invalidateContactCache(userId) {
+    await redisClient.del(CACHE_KEYS.CONTACTS(userId));
+  }
+
+  async invalidateMessageCache(userId, contactId) {
+    await redisClient.del(CACHE_KEYS.MESSAGES(userId, contactId));
+  }
+
+  async invalidatePriorityCache(userId, contactId) {
+    await redisClient.del(CACHE_KEYS.PRIORITIES(userId, contactId));
+  }
+
+  async getLastContactSyncTime(userId) {
+    return this.contactSyncTimes.get(userId);
+  }
+
+  async getLastMessage(room) {
+    try {
+      const events = room.getLiveTimeline().getEvents();
+      if (events.length === 0) return null;
+
+      // Find last message event
+      const lastMessageEvent = events.reverse().find(event => 
+        event.getType() === 'm.room.message' &&
+        event.getSender() !== this.bridgeBotUserId
+      );
+
+      if (!lastMessageEvent) return null;
+
+      return {
+        content: lastMessageEvent.getContent(),
+        sender: lastMessageEvent.getSender(),
+        timestamp: lastMessageEvent.getTs(),
+        eventId: lastMessageEvent.getId()
+      };
+    } catch (error) {
+      console.error('Error getting last message:', error);
+      return null;
+    }
+  }
+
+  async updateContacts(userId, contacts) {
+    try {
+      // Batch update contacts in database
+      const { error } = await this.adminClient
+        .from('whatsapp_bridges')
+        .upsert(
+          contacts.map(contact => ({
+            id: contact.id,
+            user_id: userId,
+            matrix_room_id: contact.id,
+            whatsapp_id: contact.whatsappId,
+            display_name: contact.displayName,
+            last_message: contact.lastMessage,
+            unread_count: contact.unreadCount,
+            updated_at: new Date().toISOString()
+          })),
+          { onConflict: 'matrix_room_id' }
+        );
+
+      if (error) {
+        throw error;
+      }
+
+      // Emit update event
+      const io = getIO();
+      if (io) {
+        io.to(userId).emit('contacts:updated', {
+          userId,
+          timestamp: Date.now()
+        });
+      }
+
+    } catch (error) {
+      console.error(`[WhatsApp Sync] Error updating contacts for user ${userId}:`, error);
+      throw error;
+    }
+  }
+
+  async getMatrixClientWithRetry(userId, maxRetries = 3) {
+    let attempts = 0;
+    let lastError;
+
+    while (attempts < maxRetries) {
+      try {
+        const client = await this.getMatrixClient(userId);
+        if (client?.clientRunning) {
+          return client;
+        }
+        
+        if (client && !client.clientRunning) {
+          await client.startClient({ initialSyncLimit: 10 });
+          return client;
+        }
+      } catch (error) {
+        lastError = error;
+        attempts++;
+        if (attempts === maxRetries) break;
+        
+        // Exponential backoff
+        await new Promise(resolve => 
+          setTimeout(resolve, Math.min(1000 * Math.pow(2, attempts), 10000))
+        );
+      }
+    }
+
+    throw lastError || new Error('Failed to get Matrix client after retries');
+  }
+
+  async waitForSync(matrixClient) {
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error('Matrix sync timeout'));
+      }, 30000);
+
+      const checkSync = () => {
+        if (matrixClient.isInitialSyncComplete()) {
+          clearTimeout(timeout);
+          resolve();
+          return;
+        }
+        setTimeout(checkSync, 1000);
+      };
+
+      matrixClient.once('sync', (state) => {
+        if (state === 'PREPARED') {
+          clearTimeout(timeout);
+          resolve();
+        } else if (state === 'ERROR') {
+          clearTimeout(timeout);
+          reject(new Error(`Sync failed with state: ${state}`));
+        }
+      });
+
+      checkSync();
+    });
   }
 
   // Add method to force sync
@@ -412,22 +655,31 @@ class WhatsAppEntityService {
   // Reset sync status (useful for testing or error recovery)
   resetSyncStatus(userId) {
     this.initialSyncComplete.delete(userId);
-    this.syncLocks.delete(userId);
+    // Clear all locks for this user
+    for (const [lockKey, timeoutId] of this.lockTimeouts.entries()) {
+      if (lockKey.startsWith(`${userId}-`)) {
+        this._clearLock(lockKey);
+      }
+    }
   }
 
   async requestSync(userId, contactId) {
     try {
-      // Verify contact belongs to user
-      const { data: contact, error: contactError } = await adminClient
+      // Get most recently updated contact record
+      const { data: contacts, error: contactError } = await adminClient
         .from('whatsapp_contacts')
-        .select('id, whatsapp_id, metadata')
+        .select('*')
         .eq('id', contactId)
         .eq('user_id', userId)
-        .single();
+        .order('updated_at', { ascending: false })
+        .limit(1);
 
-      if (contactError || !contact) {
+      if (contactError || !contacts || contacts.length === 0) {
+        console.error('[WhatsApp Service] Contact not found:', contactError);
         throw new Error('Contact not found');
       }
+
+      const contact = contacts[0];
 
       // Get Matrix client
       const matrixClient = await this.getMatrixClient(userId);
@@ -435,25 +687,53 @@ class WhatsAppEntityService {
         throw new Error('Matrix client not initialized');
       }
 
+      // Check if room exists in contact metadata
+      if (!contact.metadata?.room_id) {
+        throw new Error('No room ID found in contact metadata');
+      }
+
+      // Get room and check memberships
+      const room = matrixClient.getRoom(contact.metadata.room_id);
+      if (!room) {
+        throw new Error('Room not found');
+      }
+
+      const userMember = room.getMember(matrixClient.getUserId());
+
+      // Initialize sync status
+      await this.updateSyncStatus(userId, contactId, 'pending', {
+        current: 0,
+        total: 100,
+        status: 'initializing',
+        metadata: {
+          user_membership: userMember?.membership || 'none'
+        }
+      });
+
       // Request sync using Matrix's native sync
       const syncResult = await matrixWhatsAppService.syncMessages(userId, contactId);
 
-      // Return sync request status
+      // Update final status based on sync result
+      const finalStatus = syncResult.status === 'success' ? 'approved' : 'rejected';
+      await this.updateSyncStatus(userId, contactId, finalStatus, {
+        current: 100,
+        total: 100,
+        status: finalStatus,
+        metadata: {
+          user_membership: userMember?.membership || 'none'
+        }
+      });
+
       return {
         status: 'success',
         data: {
-          sync_status: 'pending',
-          message: 'Sync initiated using Matrix native sync',
+          sync_status: finalStatus,
+          message: `Sync ${finalStatus === 'approved' ? 'completed' : 'failed'}`,
           details: syncResult
         }
       };
-
     } catch (error) {
-      console.error('Error requesting WhatsApp sync:', error);
-      
-      // Update sync request status on error
-      await this.updateSyncStatus(userId, contactId, 'rejected');
-      
+      console.error('[WhatsApp Service] Error in requestSync:', error);
       throw error;
     }
   }
@@ -461,22 +741,38 @@ class WhatsAppEntityService {
   async waitForSync(userId, contactId, timeout = 30000) {
     return new Promise((resolve, reject) => {
       const startTime = Date.now();
+      const CHECK_INTERVAL = 1000; // Check every second
       
       const checkSync = async () => {
         try {
           const { data: contact } = await adminClient
             .from('whatsapp_contacts')
-            .select('sync_status')
+            .select('sync_status, metadata')
             .eq('user_id', userId)
             .eq('id', contactId)
             .single();
 
-          if (contact?.sync_status === 'approved') {
-            resolve(true);
-          } else if (Date.now() - startTime > timeout) {
-            reject(new Error('Sync timeout'));
-          } else {
-            setTimeout(checkSync, 1000);
+          if (!contact) {
+            reject(new Error('Contact not found'));
+            return;
+          }
+
+          switch (contact.sync_status) {
+            case this.SYNC_STATES.APPROVED:
+              resolve({
+                status: 'success',
+                contact
+              });
+              break;
+            case this.SYNC_STATES.REJECTED:
+              reject(new Error(`Sync ${contact.sync_status}: ${contact.metadata?.error || 'Unknown error'}`));
+              break;
+            default:
+              if (Date.now() - startTime > timeout) {
+                reject(new Error('Sync timeout'));
+              } else {
+                setTimeout(checkSync, CHECK_INTERVAL);
+              }
           }
         } catch (error) {
           reject(error);
@@ -487,172 +783,73 @@ class WhatsAppEntityService {
     });
   }
 
-  async getMessages(userId, contactId, limit = 50, before = null) {
-    const lockKey = `${userId}-${contactId}`;
-    if (this.syncLocks.get(lockKey)) {
-      console.log('[WhatsApp Service] Sync already in progress for:', lockKey);
-      return [];
-    }
-
+  async updateSyncStatus(userId, contactId, status, progress = null) {
     try {
-      this.syncLocks.set(lockKey, true);
-      console.log('[WhatsApp Service] getMessages called with params:', {
-        userId,
-        contactId,
-        limit,
-        before,
-        contactIdType: typeof contactId
-      });
-
-      // Input validation
-      if (!userId || !contactId) {
-        throw new Error('Missing required parameters: userId and contactId');
+      console.log(`[WhatsApp Service] Updating sync status for contact ${contactId}: ${status}`);
+      
+      // Validate status against allowed values
+      if (!Object.values(this.SYNC_STATES).includes(status)) {
+        throw new Error(`Invalid sync status: ${status}. Must be one of: pending, approved, rejected`);
       }
 
-      // Get and validate Matrix client first
-      const matrixClient = matrixWhatsAppService.getMatrixClient(userId);
-      if (!matrixClient) {
-        throw new Error('Matrix client not initialized');
-      }
-
-      // Ensure client is started and synced
-      if (!matrixClient.clientRunning) {
-        console.log('[WhatsApp Service] Starting Matrix client...');
-        await matrixClient.startClient({
-          initialSyncLimit: 10
-        });
-      }
-
-      // Wait for initial sync with timeout
-      await new Promise((resolve, reject) => {
-        const syncTimeout = setTimeout(() => {
-          reject(new Error('Matrix sync timeout'));
-        }, 30000);
-
-        if (matrixClient.isInitialSyncComplete()) {
-          clearTimeout(syncTimeout);
-          resolve();
-        } else {
-          matrixClient.once('sync', (state) => {
-            clearTimeout(syncTimeout);
-            if (state === 'PREPARED') {
-              resolve();
-            } else {
-              reject(new Error(`Sync failed with state: ${state}`));
-            }
-          });
-        }
-      });
-
-      // Convert contactId to number if it's a string
-      const numericContactId = typeof contactId === 'string' ? parseInt(contactId, 10) : contactId;
-      if (isNaN(numericContactId)) {
-        throw new Error('Invalid contact ID format');
-      }
-      console.log('[WhatsApp Service] Using numeric contactId:', numericContactId);
-
-      // Get contact record with all necessary fields
-      console.log('[WhatsApp Service] Fetching contact record');
-      const { data: contact, error: contactError } = await adminClient
+      // Get existing contact data first
+      const { data: existingContact, error: fetchError } = await adminClient
         .from('whatsapp_contacts')
-        .select('id, whatsapp_id, metadata, sync_status, bridge_room_id')
-        .eq('id', numericContactId)
+        .select('*')
+        .eq('id', contactId)
         .eq('user_id', userId)
         .single();
 
-      if (contactError) {
-        console.error('[WhatsApp Service] Contact fetch error:', contactError);
-        throw new Error(`Contact fetch failed: ${contactError.message}`);
+      if (fetchError) {
+        throw fetchError;
       }
 
-      if (!contact) {
-        console.error('[WhatsApp Service] Contact not found:', { userId, contactId: numericContactId });
-        throw new Error('Contact not found');
-      }
+      const updateData = {
+        sync_status: status,
+        metadata: {
+          ...existingContact?.metadata,
+          last_sync_attempt: new Date().toISOString(),
+          sync_history: [
+            ...(existingContact?.metadata?.sync_history || []),
+            {
+              status,
+              timestamp: new Date().toISOString(),
+              progress: progress ? {
+                current: progress.current,
+                total: progress.total,
+                percentage: Math.round((progress.current / progress.total) * 100),
+                status: progress.status
+              } : null
+            }
+          ].slice(-5) // Keep last 5 sync attempts
+        },
+        updated_at: new Date().toISOString()
+      };
 
-      console.log('[WhatsApp Service] Contact found:', {
-        contactId: contact.id,
-        whatsappId: contact.whatsapp_id,
-        syncStatus: contact.sync_status,
-        metadata: contact.metadata,
-        bridgeRoomId: contact.bridge_room_id
-      });
-
-      // Validate bridge room and bot status
-      if (!contact.bridge_room_id) {
-        console.log('[WhatsApp Service] No bridge room found, checking room status...');
-        const roomId = contact.metadata?.room_id;
-        if (!roomId) {
-          throw new Error('No room ID found for contact');
-        }
-
-        const room = await matrixClient.getRoom(roomId);
-        if (!room) {
-          throw new Error('Room not found');
-        }
-
-        // Check if bridge bot is in the room
-        const bridgeBotMember = room.getMember(this.bridgeBotUserId);
-        if (!bridgeBotMember) {
-          console.log('[WhatsApp Service] Bridge bot not found in room, attempting to invite...');
-          await this.inviteBridgeBot(userId, contact);
-          throw new Error('Bridge bot not in room - invitation sent');
-        }
-
-        // Update contact with bridge room ID if available
-        const bridgeRoomId = room.roomId;
-        if (bridgeRoomId) {
-          await this.updateContact(userId, numericContactId, {
-            bridge_room_id: bridgeRoomId
-          });
-          contact.bridge_room_id = bridgeRoomId;
-        }
-      }
-
-      // Get messages with improved error handling
-      try {
-        const messages = await this._fetchMessagesFromRoom(
-          matrixClient,
-          contact.bridge_room_id,
-          limit,
-          before
-        );
-        
-        if (!messages || messages.length === 0) {
-          console.log('[WhatsApp Service] No messages found, triggering sync...');
-          await this.requestSync(userId, numericContactId);
-        }
-        
-        return messages || [];
-      } catch (error) {
-        console.error('[WhatsApp Service] Error fetching messages:', error);
-        throw new Error(`Failed to fetch messages: ${error.message}`);
-      }
-    } catch (error) {
-      console.error('[WhatsApp Service] Error in getMessages:', error);
-      console.error('[WhatsApp Service] Stack:', error.stack);
-      throw error;
-    } finally {
-      this.syncLocks.delete(lockKey);
-    }
-  }
-
-  async updateSyncStatus(userId, contactId, status) {
-    try {
       const { data, error } = await adminClient
-        .from('whatsapp_sync_requests')
-        .update({
-          status,
-          approved_at: status === 'approved' ? new Date().toISOString() : null
-        })
+        .from('whatsapp_contacts')
+        .update(updateData)
         .eq('user_id', userId)
-        .eq('contact_id', contactId)
+        .eq('id', contactId)
+        .select()
         .single();
 
       if (error) throw error;
+
+      // Emit status update via Socket.IO
+      const io = getIO();
+      if (io) {
+        io.to(`user:${userId}`).emit('whatsapp:sync_status', {
+          contactId,
+          status,
+          progress,
+          timestamp: new Date().toISOString()
+        });
+      }
+
       return data;
     } catch (error) {
-      console.error('Error updating sync status:', error);
+      console.error('[WhatsApp Service] Error updating sync status:', error);
       throw error;
     }
   }
@@ -734,6 +931,397 @@ class WhatsAppEntityService {
       type: 'message'
     }));
   }
+
+  async updateContactStatus(userId, contactId, status, error = null) {
+    try {
+      const { data, error: dbError } = await adminClient
+        .from('whatsapp_contacts')
+        .update({
+          sync_status: status,
+          metadata: {
+            error: error,
+            last_invite_attempt: new Date().toISOString()
+          }
+        })
+        .eq('user_id', userId)
+        .eq('id', contactId);
+
+      if (dbError) throw dbError;
+      
+      // Emit status update
+      const io = getIO();
+      if (io) {
+        io.to(`user:${userId}`).emit('whatsapp:sync_status', {
+          contactId,
+          status,
+          error
+        });
+      }
+    } catch (error) {
+      console.error('[WhatsApp Service] Error updating contact status:', error);
+    }
+  }
+
+  async startWhatsAppSyncJob() {
+    try {
+      // Initialize sync job state
+      this.syncJobRunning = false;
+      this.lastSyncTime = null;
+      this.syncErrors = new Map();
+      this.syncInterval = 5 * 60 * 1000; // 5 minutes
+
+      // Start periodic sync job
+      this.syncJobInterval = setInterval(async () => {
+        if (this.syncJobRunning) {
+          console.log('[WhatsApp Sync] Previous sync job still running, skipping...');
+          return;
+        }
+
+        this.syncJobRunning = true;
+        try {
+          // Get all users with WhatsApp bridges
+          const { data: users, error: userError } = await this.adminClient
+            .from('accounts')
+            .select('user_id')
+            .eq('platform', 'matrix')
+            .not('credentials', 'is', null);
+
+          if (userError) {
+            throw new Error(`Failed to fetch users: ${userError.message}`);
+          }
+
+          // Process each user's WhatsApp contacts
+          for (const user of users) {
+            try {
+              const userId = user.user_id;
+              const lockKey = `sync:${userId}`;
+
+              // Skip if locked
+              if (this.syncLocks.get(lockKey)) {
+                console.log(`[WhatsApp Sync] Sync locked for user ${userId}, skipping...`);
+                continue;
+              }
+
+              // Set lock with timeout
+              this._setLock(lockKey);
+
+              try {
+                // Get Matrix client
+                const matrixClient = await this.getMatrixClient(userId);
+                if (!matrixClient) {
+                  console.error(`[WhatsApp Sync] No Matrix client for user ${userId}`);
+                  continue;
+                }
+
+                // Sync WhatsApp contacts
+                await this.syncContacts(userId);
+
+                // Update last sync time
+                this.contactSyncTimes.set(userId, Date.now());
+
+              } catch (error) {
+                console.error(`[WhatsApp Sync] Error syncing user ${userId}:`, error);
+                this.syncErrors.set(userId, {
+                  error: error.message,
+                  timestamp: Date.now()
+                });
+              } finally {
+                // Clear lock
+                this._clearLock(lockKey);
+              }
+            } catch (userError) {
+              console.error('[WhatsApp Sync] Error processing user:', userError);
+            }
+          }
+
+          this.lastSyncTime = Date.now();
+          console.log('[WhatsApp Sync] Sync job completed');
+
+        } catch (error) {
+          console.error('[WhatsApp Sync] Sync job error:', error);
+        } finally {
+          this.syncJobRunning = false;
+        }
+      }, this.syncInterval);
+
+      console.log('[WhatsApp Sync] Sync job service started');
+      return true;
+    } catch (error) {
+      console.error('[WhatsApp Sync] Failed to start sync job service:', error);
+      throw error;
+    }
+  }
+
+  async cleanup() {
+    if (this.syncJobInterval) {
+      clearInterval(this.syncJobInterval);
+    }
+    this.syncLocks.clear();
+    this.lockTimeouts.forEach(clearTimeout);
+    this.lockTimeouts.clear();
+  }
 }
 
-export const whatsappEntityService = new WhatsAppEntityService(); 
+export const whatsappEntityService = new WhatsAppEntityService();
+export const startWhatsAppSyncJob = () => whatsappEntityService.startWhatsAppSyncJob();
+
+// whatsappEntityService.getCachedContacts('3ef66b64-4a8b-460f-b70f-8c0ddd8e73ff').then(contacts => {
+//   console.log('[WhatsAppEntityService] Fetched cached contacts:', contacts);
+// }).catch(error => {
+//   console.error('[WhatsAppEntityService] Error fetching cached contacts:', error);
+// });
+
+export async function getContacts(userId) {
+  const CACHE_KEY = `whatsapp:${userId}:contacts`;
+  const CACHE_DURATION = 300; // 5 minutes
+
+  try {
+    // Check cache first
+    const cachedContacts = await pubClient.get(CACHE_KEY);
+    if (cachedContacts) {
+      const parsed = JSON.parse(cachedContacts);
+      // Return cached data if it's less than 5 minutes old
+      if (Date.now() - parsed.timestamp < CACHE_DURATION * 1000) {
+        return parsed.contacts;
+      }
+    }
+
+    // Fetch fresh contacts
+    const contacts = await fetchContactsFromMatrix(userId);
+    
+    // Cache with metadata
+    const contactData = {
+      contacts,
+      timestamp: Date.now(),
+      count: contacts.length
+    };
+
+    // Set cache with expiration
+    await pubClient.set(
+      CACHE_KEY,
+      JSON.stringify(contactData),
+      'EX',
+      CACHE_DURATION
+    );
+
+    // Set a secondary index for quick contact count
+    await pubClient.set(
+      `whatsapp:${userId}:contact_count`,
+      contacts.length,
+      'EX',
+      CACHE_DURATION
+    );
+
+    return contacts;
+  } catch (error) {
+    console.error('Failed to fetch contacts:', error);
+    // Return cached data if available, even if expired
+    const staleCache = await pubClient.get(CACHE_KEY);
+    if (staleCache) {
+      return JSON.parse(staleCache).contacts;
+    }
+    throw error;
+  }
+}
+
+export async function updateContact(userId, contactId, updates) {
+  try {
+    const result = await updateContactInMatrix(userId, contactId, updates);
+    
+    // Invalidate contact cache
+    await pubClient.del(`whatsapp:${userId}:contacts`);
+    await pubClient.del(`whatsapp:${userId}:contact_count`);
+    
+    return result;
+  } catch (error) {
+    console.error('Failed to update contact:', error);
+    throw error;
+  }
+}
+
+// Concurrency control for sync operations
+const syncLocks = new Map();
+const LOCK_TIMEOUT = 30000; // 30 seconds
+
+const acquireSyncLock = async (userId, entityId) => {
+  const lockKey = `${userId}:${entityId}`;
+  
+  if (syncLocks.has(lockKey)) {
+    const { timestamp, operation } = syncLocks.get(lockKey);
+    if (Date.now() - timestamp < LOCK_TIMEOUT) {
+      throw new Error(`Sync operation "${operation}" already in progress`);
+    }
+  }
+  
+  syncLocks.set(lockKey, {
+    timestamp: Date.now(),
+    operation: 'sync'
+  });
+  
+  return {
+    release: () => syncLocks.delete(lockKey)
+  };
+};
+
+// Enhanced error handling for WhatsApp operations
+const handleWhatsAppError = async (error, context) => {
+  const errorType = getErrorType(error);
+  
+  switch (errorType) {
+    case ERROR_TYPES.RATE_LIMIT:
+      await handleRateLimitError(context);
+      break;
+    case ERROR_TYPES.AUTH:
+      await handleAuthError(context);
+      break;
+    case ERROR_TYPES.NETWORK:
+      await handleNetworkError(context);
+      break;
+    default:
+      logger.error(`WhatsApp operation failed: ${error.message}`, context);
+      throw error;
+  }
+};
+
+// Enhance existing functions with concurrency control
+const enhanceWithConcurrency = (fn) => {
+  return async function (...args) {
+    const [userId, entityId] = args;
+    const lock = await acquireSyncLock(userId, entityId);
+    
+    try {
+      return await fn.apply(this, args);
+    } finally {
+      lock.release();
+    }
+  };
+};
+
+// Apply enhancements to existing functions while preserving their signatures
+const originalFunctions = {
+  syncContacts: whatsappEntityService.syncContacts,
+  syncMessages: whatsappEntityService.syncMessages
+};
+
+whatsappEntityService.syncContacts = enhanceWithConcurrency(originalFunctions.syncContacts);
+whatsappEntityService.syncMessages = enhanceWithConcurrency(originalFunctions.syncMessages);
+
+async function getRoomsWithRetry(matrixClient, maxRetries = 3) {
+  let attempts = 0;
+  let lastError;
+
+  while (attempts < maxRetries) {
+    try {
+      const rooms = matrixClient.getRooms() || [];
+      return rooms;
+    } catch (error) {
+      lastError = error;
+      attempts++;
+      if (attempts === maxRetries) break;
+      
+      await new Promise(resolve => 
+        setTimeout(resolve, Math.min(1000 * Math.pow(2, attempts), 10000))
+      );
+    }
+  }
+
+  throw lastError || new Error('Failed to get rooms after retries');
+}
+
+async function processContactsWithRetry(whatsappRooms, maxRetries = 3) {
+  const contacts = [];
+  const errors = [];
+
+  for (const room of whatsappRooms) {
+    let attempts = 0;
+    let processed = false;
+
+    while (attempts < maxRetries && !processed) {
+      try {
+        const whatsappId = this._extractWhatsAppId(room);
+        if (!whatsappId) continue;
+
+        const contact = await this._buildContactObject(room, whatsappId);
+        contacts.push(contact);
+        processed = true;
+      } catch (error) {
+        attempts++;
+        if (attempts === maxRetries) {
+          errors.push({
+            roomId: room.roomId,
+            error: error.message
+          });
+        } else {
+          await new Promise(resolve => 
+            setTimeout(resolve, Math.min(1000 * Math.pow(2, attempts), 10000))
+          );
+        }
+      }
+    }
+  }
+
+  if (errors.length > 0) {
+    logger.warn('[WhatsApp Service] Some contacts failed to process:', { errors });
+  }
+
+  return contacts;
+}
+
+async function _buildContactObject(room, whatsappId) {
+  const contact = {
+    whatsapp_id: whatsappId,
+    display_name: room.name,
+    room_id: room.roomId,
+    is_group: room.isGroup,
+    last_message: null,
+    unread_count: 0,
+    updated_at: new Date().toISOString()
+  };
+
+  try {
+    // Get latest message with error handling
+    const timeline = room.timeline;
+    if (timeline?.length > 0) {
+      const lastMsg = timeline[timeline.length - 1];
+      const content = lastMsg.getContent();
+      
+      contact.last_message = content.body;
+      contact.last_message_at = new Date(lastMsg.getTs()).toISOString();
+      
+      // Get unread count
+      const readUpToEventId = room.getEventReadUpTo(this.userId);
+      contact.unread_count = timeline
+        .filter(event => event.getId() > readUpToEventId)
+        .length;
+    }
+  } catch (error) {
+    logger.warn('[WhatsApp Service] Error getting message details:', {
+      roomId: room.roomId,
+      error: error.message
+    });
+  }
+
+  return contact;
+}
+
+async function updateContactsWithRetry(userId, contacts, maxRetries = 3) {
+  let attempts = 0;
+  let lastError;
+
+  while (attempts < maxRetries) {
+    try {
+      await this._updateContacts(userId, contacts);
+      return;
+    } catch (error) {
+      lastError = error;
+      attempts++;
+      if (attempts === maxRetries) break;
+      
+      await new Promise(resolve => 
+        setTimeout(resolve, Math.min(1000 * Math.pow(2, attempts), 10000))
+      );
+    }
+  }
+
+  throw lastError || new Error('Failed to update contacts after retries');
+}

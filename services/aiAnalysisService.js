@@ -117,7 +117,11 @@ class AIAnalysisService {
 
       if (!messages?.length) {
         console.info('No messages found for analysis', { userId, contactId });
-        return null;
+        return {
+          suggestedPriority: 'LOW',  // Default to LOW for new contacts
+          confidence: 1.0,
+          reason: 'No messages available for analysis'
+        };
       }
 
       // Prepare messages for AI analysis

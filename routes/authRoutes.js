@@ -1,9 +1,6 @@
 import express from 'express';
-import jwt from 'jsonwebtoken';
-import User from '../models/User.js';
-import bcrypt from 'bcryptjs';
-import authMiddleware from '../middleware/authMiddleware.js';
 import { adminClient } from '../utils/supabase.js';
+import authMiddleware from '../middleware/authMiddleware.js';
 
 const router = express.Router();
 
@@ -12,49 +9,42 @@ router.post('/signup', async (req, res) => {
   try {
     const { firstName, lastName, email, password } = req.body;
 
-    // Check if user already exists
-    const existingUser = await User.findOne({ email });
-    if (existingUser) {
-      return res.status(400).json({ error: 'Email already registered' });
-    }
-
-    // Hash password
-    const salt = await bcrypt.genSalt(10);
-    const hashedPassword = await bcrypt.hash(password, salt);
-
-    // Create new user
-    const user = new User({
-      firstName,
-      lastName,
+    // Create user in Supabase
+    const { data: { user }, error: signUpError } = await adminClient.auth.admin.createUser({
       email,
-      password: hashedPassword
+      password,
+      user_metadata: {
+        firstName,
+        lastName
+      }
     });
 
-    await user.save();
+    if (signUpError) {
+      if (signUpError.message.includes('already exists')) {
+        return res.status(400).json({ error: 'Email already registered' });
+      }
+      throw signUpError;
+    }
 
-    // Generate JWT token
-    const token = jwt.sign(
-      { userId: user._id },
-      process.env.JWT_SECRET,
-      { expiresIn: '24h' }
-    );
+    // Create session for the new user
+    const { data: { session }, error: sessionError } = await adminClient.auth.admin.createSession({
+      userId: user.id
+    });
+
+    if (sessionError) throw sessionError;
 
     res.status(201).json({
-      token,
+      token: session.access_token,
       user: {
-        id: user._id,
-        firstName: user.firstName,
-        lastName: user.lastName,
+        id: user.id,
+        firstName: user.user_metadata.firstName,
+        lastName: user.user_metadata.lastName,
         email: user.email
       }
     });
   } catch (error) {
     console.error('Signup error:', error);
-    if (error.name === 'MongooseError') {
-      res.status(500).json({ error: 'Database connection error. Please try again.' });
-    } else {
-      res.status(500).json({ error: 'Server error during signup' });
-    }
+    res.status(500).json({ error: 'Server error during signup' });
   }
 });
 
@@ -63,31 +53,24 @@ router.post('/login', async (req, res) => {
   try {
     const { email, password } = req.body;
 
-    // Find user
-    const user = await User.findOne({ email });
-    if (!user) {
+    // Sign in with Supabase
+    const { data: { session }, error: signInError } = await adminClient.auth.signInWithPassword({
+      email,
+      password
+    });
+
+    if (signInError) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
-    // Verify password
-    const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch) {
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
-
-    // Generate JWT token
-    const token = jwt.sign(
-      { userId: user._id },
-      process.env.JWT_SECRET,
-      { expiresIn: '24h' }
-    );
+    const { user } = session;
 
     res.json({
-      token,
+      token: session.access_token,
       user: {
-        id: user._id,
-        firstName: user.firstName,
-        lastName: user.lastName,
+        id: user.id,
+        firstName: user.user_metadata.firstName,
+        lastName: user.user_metadata.lastName,
         email: user.email
       }
     });
@@ -105,18 +88,17 @@ router.get('/verify', async (req, res) => {
       return res.status(401).json({ error: 'No token provided' });
     }
 
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const user = await User.findById(decoded.userId);
+    const { data: { user }, error } = await adminClient.auth.getUser(token);
     
-    if (!user) {
+    if (error || !user) {
       return res.status(401).json({ error: 'Invalid token' });
     }
 
     res.json({
       user: {
-        id: user._id,
-        firstName: user.firstName,
-        lastName: user.lastName,
+        id: user.id,
+        firstName: user.user_metadata.firstName,
+        lastName: user.user_metadata.lastName,
         email: user.email
       }
     });
@@ -129,7 +111,6 @@ router.get('/verify', async (req, res) => {
 router.get('/session', authMiddleware, async (req, res) => {
   try {
     const user = req.user;
-    const authType = req.authType;
 
     if (!user) {
       return res.status(401).json({ error: 'No active session' });
@@ -138,22 +119,12 @@ router.get('/session', authMiddleware, async (req, res) => {
     // Get the token from the request header
     const token = req.headers.authorization?.split(' ')[1];
 
-    // If using JWT, get a Supabase token for socket auth
-    let socketToken = token;
-    if (authType === 'jwt') {
-      const { data: { session }, error } = await adminClient.auth.admin.createSession({
-        userId: user.id
-      });
-      
-      if (error) throw error;
-      socketToken = session.access_token;
-    }
-
     res.json({
-      token: socketToken,
+      token,
       userId: user.id,
       email: user.email,
-      authType,
+      firstName: user.user_metadata.firstName,
+      lastName: user.user_metadata.lastName,
       lastActivity: new Date().toISOString()
     });
   } catch (error) {

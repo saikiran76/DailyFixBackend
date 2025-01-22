@@ -6,6 +6,197 @@ import { adminClient } from '../utils/supabase.js';
 
 const router = express.Router();
 
+// In-memory sync status tracking with TTL management
+const activeSyncs = new Map();
+const SYNC_TIMEOUT = 5 * 60 * 1000; // 5 minutes
+
+// Enhanced SyncManager with TTL and recovery
+const SyncManager = {
+  _cleanupInterval: null,
+
+  startCleanupInterval() {
+    if (!this._cleanupInterval) {
+      this._cleanupInterval = setInterval(() => this.cleanupStaleSync(), 60 * 1000);
+      this._cleanupInterval.unref(); // Don't prevent process exit
+    }
+  },
+
+  stopCleanupInterval() {
+    if (this._cleanupInterval) {
+      clearInterval(this._cleanupInterval);
+      this._cleanupInterval = null;
+    }
+  },
+
+  // Helper method to emit socket events with retry
+  _emitSyncUpdate: async (userId, contactId, update) => {
+    try {
+      const io = global.io;
+      if (!io) {
+        logger.warn('[SyncManager] Socket.io instance not available');
+        return;
+      }
+
+      const event = {
+        contactId: parseInt(contactId),
+        timestamp: new Date().toISOString(),
+        ...update
+      };
+
+      // Emit with retry logic
+      const maxRetries = 3;
+      let attempts = 0;
+      
+      while (attempts < maxRetries) {
+        try {
+          await new Promise((resolve, reject) => {
+            io.to(`user:${userId}`).emit('whatsapp:sync_status', event, (ack) => {
+              if (ack?.error) reject(new Error(ack.error));
+              else resolve();
+            });
+
+            // Timeout after 5 seconds
+            setTimeout(() => reject(new Error('Emit timeout')), 5000);
+          });
+          break; // Success, exit retry loop
+        } catch (error) {
+          attempts++;
+          if (attempts === maxRetries) {
+            logger.error('[SyncManager] Max retry attempts reached for sync update:', {
+              userId,
+              contactId,
+              error: error.message
+            });
+          } else {
+            await new Promise(resolve => setTimeout(resolve, 1000 * attempts));
+          }
+        }
+      }
+    } catch (error) {
+      logger.error('[SyncManager] Error emitting sync update:', {
+        error: error.message,
+        userId,
+        contactId
+      });
+    }
+  },
+
+  startSync: (userId, contactId) => {
+    const key = `${userId}-${contactId}`;
+    if (!activeSyncs.has(key)) {
+      const syncData = {
+        status: 'syncing',
+        startTime: Date.now(),
+        lastUpdated: Date.now(),
+        progress: {
+          current: 0,
+          total: 0,
+          percentage: 0,
+          status: 'Initializing sync...'
+        }
+      };
+      activeSyncs.set(key, syncData);
+      
+      SyncManager._emitSyncUpdate(userId, contactId, {
+        status: 'syncing',
+        progress: syncData.progress
+      });
+    }
+    return activeSyncs.get(key);
+  },
+  
+  getStatus: (userId, contactId) => {
+    const key = `${userId}-${contactId}`;
+    return activeSyncs.get(key);
+  },
+  
+  updateProgress: (userId, contactId, progress) => {
+    const key = `${userId}-${contactId}`;
+    const sync = activeSyncs.get(key);
+    if (sync) {
+      sync.progress = {
+        current: progress.current,
+        total: progress.total,
+        percentage: Math.round((progress.current / progress.total) * 100),
+        status: progress.status || 'Syncing messages...'
+      };
+      
+      // Emit progress update
+      SyncManager._emitSyncUpdate(userId, contactId, {
+        status: 'syncing',
+        progress: sync.progress
+      });
+    }
+    return sync;
+  },
+  
+  completeSync: (userId, contactId, success = true) => {
+    const key = `${userId}-${contactId}`;
+    const sync = activeSyncs.get(key);
+    if (sync) {
+      sync.status = success ? 'completed' : 'failed';
+      if (success && sync.progress) {
+        sync.progress.percentage = 100;
+        sync.progress.status = 'Sync completed';
+      }
+      
+      // Emit completion status
+      SyncManager._emitSyncUpdate(userId, contactId, {
+        status: sync.status,
+        progress: sync.progress,
+        error: !success ? 'Sync failed' : undefined
+      });
+
+      // Cleanup after delay
+      setTimeout(() => {
+        activeSyncs.delete(key);
+        // Emit final cleanup status
+        SyncManager._emitSyncUpdate(userId, contactId, {
+          status: 'idle',
+          progress: null
+        });
+      }, 5000);
+    }
+    return sync;
+  },
+  
+  cleanupStaleSync: () => {
+    const now = Date.now();
+    let cleaned = 0;
+
+    for (const [key, sync] of activeSyncs.entries()) {
+      // Check both start time and last update time
+      const timeSinceStart = now - sync.startTime;
+      const timeSinceUpdate = now - (sync.lastUpdated || sync.startTime);
+
+      if (timeSinceStart > SYNC_TIMEOUT || timeSinceUpdate > SYNC_TIMEOUT / 2) {
+        const [userId, contactId] = key.split('-');
+        
+        // Emit timeout status before cleanup
+        SyncManager._emitSyncUpdate(userId, parseInt(contactId), {
+          status: 'failed',
+          error: 'Sync timeout',
+          progress: sync.progress
+        });
+
+        activeSyncs.delete(key);
+        cleaned++;
+      }
+    }
+
+    if (cleaned > 0) {
+      logger.info(`[SyncManager] Cleaned up ${cleaned} stale sync(s)`);
+    }
+  }
+};
+
+// Start cleanup interval when module loads
+SyncManager.startCleanupInterval();
+
+// Cleanup on process exit
+process.on('SIGTERM', () => SyncManager.stopCleanupInterval());
+process.on('SIGINT', () => SyncManager.stopCleanupInterval());
+
 // Apply authentication middleware
 router.use(authenticateUser);
 
@@ -13,23 +204,59 @@ router.use(authenticateUser);
 router.get('/contacts', async (req, res) => {
   try {
     const userId = req.user.id;
-    const { force } = req.query;
+    console.log('[Contacts] Fetching contacts for user:', userId);
 
-    console.log('[WhatsApp Contacts Route] Fetching contacts:', {
-      userId,
-      forceSync: force === 'true'
+    // Get cached contacts first for immediate response
+    const cachedContacts = await whatsappEntityService.getCachedContacts(userId);
+    
+    // Start background sync if needed
+    const lastSyncTime = await whatsappEntityService.getLastContactSyncTime(userId);
+    const SYNC_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes
+    
+    if (!lastSyncTime || Date.now() - lastSyncTime > SYNC_THRESHOLD_MS) {
+      console.log('[Contacts] Starting background sync for user:', userId);
+      whatsappEntityService.syncContacts(userId).catch(error => {
+        console.error('[Contacts] Background sync failed:', error);
+      });
+    }
+
+    // Transform contacts for consistent response
+    const transformedContacts = (cachedContacts || []).map(contact => {
+      // Extract priority-related fields from metadata if they exist
+      const priorityInfo = contact.metadata?.priority_info || {};
+      
+      return {
+        id: contact.id,
+        whatsapp_id: contact.whatsapp_id,
+        display_name: contact.display_name || contact.whatsapp_id,
+        avatar_url: contact.profile_photo_url || null,
+        last_message: contact.metadata?.last_message?.content || '',
+        last_message_at: contact.last_message_at || null,
+        unread_count: contact.unread_count || 0,
+        priority: contact.priority || priorityInfo.priority || null,
+        last_analysis_at: contact.last_analysis_at || priorityInfo.last_analysis_at || null,
+        is_group: contact.is_group || false,
+        sync_status: contact.sync_status || 'pending'
+      };
     });
 
-    const contacts = await whatsappEntityService.getContacts(userId, force === 'true');
-    res.json({
+    return res.json({
       status: 'success',
-      data: contacts
+      data: transformedContacts,
+      meta: {
+        sync_info: {
+          last_sync: lastSyncTime,
+          is_syncing: lastSyncTime === null
+        }
+      }
     });
+
   } catch (error) {
-    console.error('Error fetching contacts:', error);
-    res.status(500).json({
+    console.error('[Contacts] Error fetching contacts:', error);
+    return res.status(500).json({
       status: 'error',
-      message: error.message
+      message: 'Failed to fetch contacts',
+      details: error.message
     });
   }
 });
@@ -78,17 +305,52 @@ router.post('/contacts/:contactId/sync', validateRequest(['contactId']), async (
   try {
     const userId = req.user.id;
     const { contactId } = req.params;
+    const { force } = req.query;
 
-    const syncRequest = await whatsappEntityService.requestSync(userId, parseInt(contactId));
+    // Check if sync is already in progress
+    const activeSync = SyncManager.getStatus(userId, parseInt(contactId));
+    if (activeSync && !force) {
+      return res.json({
+        status: 'success',
+        data: {
+          sync_status: {
+            status: activeSync.status,
+            progress: activeSync.progress
+          }
+        }
+      });
+    }
+
+    // Start new sync
+    console.log('[WhatsApp Sync Route] Initiating sync for contact:', contactId);
+    const syncInfo = SyncManager.startSync(userId, parseInt(contactId));
+
+    // Trigger sync in background
+    whatsappEntityService.syncMessages(userId, parseInt(contactId))
+      .then(() => {
+        SyncManager.completeSync(userId, parseInt(contactId), true);
+      })
+      .catch(error => {
+        console.error('[WhatsApp Sync Route] Sync failed:', error);
+        SyncManager.completeSync(userId, parseInt(contactId), false);
+      });
+
+    // Return immediately with sync started status
     res.json({
       status: 'success',
-      data: syncRequest
+      data: {
+        sync_status: {
+          status: syncInfo.status,
+          progress: syncInfo.progress
+        }
+      }
     });
+
   } catch (error) {
-    console.error('Error requesting sync:', error);
-    res.status(error.message.includes('not found') ? 404 : 500).json({
+    console.error('[WhatsApp Sync Route] Error:', error);
+    res.status(500).json({
       status: 'error',
-      message: error.message
+      message: error.message || 'Failed to start sync'
     });
   }
 });
@@ -98,55 +360,101 @@ router.get('/contacts/:contactId/messages', validateRequest(['contactId']), asyn
   try {
     const userId = req.user.id;
     const { contactId } = req.params;
-    const { limit, before } = req.query;
+    const { page = 1, limit = 50 } = req.query;
+    
+    console.log('[Messages] Fetching messages:', { userId, contactId, page, limit });
 
-    console.log('[WhatsApp Messages Route] Received request:', {
-      method: req.method,
-      url: req.url,
-      params: req.params,
-      query: req.query,
-      headers: {
-        ...req.headers,
-        authorization: req.headers.authorization ? '[REDACTED]' : undefined
-      },
-      userId,
-      contactId
+    // Get cached messages first
+    const messages = await whatsappEntityService.getMessages(userId, contactId, {
+      page: parseInt(page),
+      limit: parseInt(limit)
     });
 
-    // Validate parameters
-    if (!userId || !contactId) {
-      console.error('[WhatsApp Messages Route] Missing required parameters:', { userId, contactId });
-      return res.status(400).json({
-        status: 'error',
-        message: 'Missing required parameters'
-      });
+    // Get sync status from manager
+    const syncInfo = SyncManager.getStatus(userId, parseInt(contactId));
+
+    // If no messages and no sync in progress, trigger a sync
+    if (messages.length === 0 && (!syncInfo || syncInfo.status === 'idle')) {
+      console.log('[Messages] No messages found, triggering sync');
+      try {
+        const syncResult = await matrixWhatsAppService.syncMessages(userId, contactId);
+        console.log('[Messages] Sync triggered:', syncResult);
+        
+        // Get messages again after sync
+        const updatedMessages = await whatsappEntityService.getMessages(userId, contactId, {
+          page: parseInt(page),
+          limit: parseInt(limit)
+        });
+        
+        // Transform messages for consistent response
+        const transformedMessages = updatedMessages.map(msg => ({
+          id: msg.id,
+          content: msg.content,
+          timestamp: msg.timestamp,
+          direction: msg.direction,
+          status: msg.status || 'unknown',
+          media_url: msg.media_url || null,
+          media_type: msg.media_type || null
+        }));
+
+        return res.json({
+          status: 'success',
+          data: {
+            messages: transformedMessages,
+            status: 'syncing',
+            total: null,
+            sync_info: { status: 'syncing' },
+            pagination: {
+              page: parseInt(page),
+              limit: parseInt(limit),
+              has_more: transformedMessages.length === parseInt(limit)
+            }
+          }
+        });
+      } catch (syncError) {
+        console.error('[Messages] Sync error:', syncError);
+      }
     }
 
-    console.log('[WhatsApp Messages Route] Calling getMessages service');
-    const messages = await whatsappEntityService.getMessages(
-      userId,
-      parseInt(contactId),
-      limit ? parseInt(limit) : undefined,
-      before
-    );
+    // Transform messages for consistent response
+    const transformedMessages = messages.map(msg => ({
+      id: msg.id,
+      content: msg.content,
+      timestamp: msg.timestamp,
+      direction: msg.direction,
+      status: msg.status || 'unknown',
+      media_url: msg.media_url || null,
+      media_type: msg.media_type || null
+    }));
 
-    console.log(`[WhatsApp Messages Route] Service response:`, {
-      messageCount: messages?.length || 0,
-      firstMessageTimestamp: messages?.[0]?.timestamp,
-      lastMessageTimestamp: messages?.[messages?.length - 1]?.timestamp
-    });
+    // Get total message count
+    const { data: totalCount } = await adminClient
+      .from('whatsapp_messages')
+      .select('id', { count: 'exact', head: true })
+      .eq('user_id', userId)
+      .eq('contact_id', contactId);
 
-    res.json({
+    return res.json({
       status: 'success',
-      data: messages
+      data: {
+        messages: transformedMessages,
+        status: syncInfo?.status || 'idle',
+        total: totalCount,
+        sync_info: syncInfo || { status: 'idle' },
+        pagination: {
+          page: parseInt(page),
+          limit: parseInt(limit),
+          has_more: messages.length === parseInt(limit)
+        }
+      }
     });
+
   } catch (error) {
-    console.error('[Messages Route] Error:', error);
-    console.error('[Messages Route] Stack:', error.stack);
-    res.status(error.message.includes('not approved') ? 403 : 500).json({
+    console.error('[Messages] Error fetching messages:', error);
+    return res.status(500).json({
       status: 'error',
-      message: error.message,
-      details: error.stack
+      message: 'Failed to fetch messages',
+      details: error.message
     });
   }
 });
@@ -200,6 +508,117 @@ router.post('/contacts/:contactId/messages/read', validateRequest(['contactId'])
     });
   } catch (error) {
     console.error('Error marking messages as read:', error);
+    res.status(500).json({
+      status: 'error',
+      message: error.message
+    });
+  }
+});
+
+// Accept contact invitation
+router.post('/contacts/:contactId/accept', validateRequest(['contactId']), async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { contactId } = req.params;
+
+    console.log('Authenticated user:', {
+      id: userId,
+      email: req.user.email,
+      path: req.path,
+      method: req.method
+    });
+
+    // Get contact details first
+    const { data: contact, error: contactError } = await adminClient
+      .from('whatsapp_contacts')
+      .select('*')
+      .eq('user_id', userId)
+      .eq('id', parseInt(contactId))
+      .single();
+
+    if (contactError) throw contactError;
+    if (!contact) {
+      return res.status(404).json({
+        status: 'error',
+        message: 'Contact not found'
+      });
+    }
+
+    // Verify contact is in 'invite' state
+    if (contact.metadata?.membership !== 'invite') {
+      return res.status(400).json({
+        status: 'error',
+        message: 'Contact is not in invite state'
+      });
+    }
+
+    // Update contact status to reflect user acceptance
+    const { error: updateError } = await adminClient
+      .from('whatsapp_contacts')
+      .update({
+        metadata: {
+          ...contact.metadata,
+          membership: 'join',
+          last_action: 'invite_accepted',
+          last_action_timestamp: new Date().toISOString()
+        }
+      })
+      .eq('id', parseInt(contactId))
+      .eq('user_id', userId);
+
+    if (updateError) throw updateError;
+
+    res.json({
+      status: 'success',
+      data: {
+        message: 'Invitation accepted successfully'
+      }
+    });
+  } catch (error) {
+    console.error('Error accepting invitation:', error);
+    res.status(500).json({
+      status: 'error',
+      message: error.message
+    });
+  }
+});
+
+// Get sync status for a contact
+router.get('/contacts/:contactId/sync-status', validateRequest(['contactId']), async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { contactId } = req.params;
+
+    console.log('[WhatsApp Service] Checking sync status:', {
+      userId,
+      contactId
+    });
+
+    // Get contact with sync status
+    const { data: contact, error } = await adminClient
+      .from('whatsapp_contacts')
+      .select('*')
+      .eq('user_id', userId)
+      .eq('id', parseInt(contactId))
+      .single();
+
+    if (error) throw error;
+    if (!contact) {
+      return res.status(404).json({
+        status: 'error',
+        message: 'Contact not found'
+      });
+    }
+
+    res.json({
+      status: 'success',
+      data: {
+        sync_status: contact.sync_status,
+        metadata: contact.metadata
+      }
+    });
+  } catch (error) {
+    console.error('Error checking sync status:', error);
     res.status(500).json({
       status: 'error',
       message: error.message

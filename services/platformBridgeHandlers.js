@@ -2,31 +2,80 @@ import sdk from 'matrix-js-sdk';
 import { BRIDGE_CONFIGS, BRIDGE_TIMEOUTS } from '../config/bridgeConfig.js';
 import { supabase } from '../utils/supabase.js';
 import { ioEmitter } from '../utils/emitter.js';
+import { logger } from '../utils/logger.js';
+
+const BRIDGE_STATES = {
+  INITIALIZING: 'initializing',
+  WAITING_FOR_QR: 'waiting_for_qr',
+  CONNECTED: 'connected',
+  DISCONNECTED: 'disconnected',
+  ERROR: 'error'
+};
 
 async function createBridgeRoom(matrixClient, platform) {
-  const room = await matrixClient.createRoom({
-    visibility: 'private',
-    invite: [BRIDGE_CONFIGS[platform].bridgeBot]
-  });
-
-  // Wait for bridge bot to join
-  await new Promise((resolve) => {
-    const timeout = setTimeout(() => resolve(), 5000);
-    matrixClient.on('RoomMember.membership', (event, member) => {
-      if (member.roomId === room.room_id && 
-          member.userId === BRIDGE_CONFIGS[platform].bridgeBot && 
-          member.membership === 'join') {
-        clearTimeout(timeout);
-        resolve();
-      }
+  try {
+    const room = await matrixClient.createRoom({
+      visibility: 'private',
+      invite: [BRIDGE_CONFIGS[platform].bridgeBot]
     });
-  });
 
-  return room;
+    logger.info(`Created bridge room for ${platform}: ${room.room_id}`);
+
+    // Wait for bridge bot to join with timeout
+    const botJoined = await new Promise((resolve) => {
+      const timeout = setTimeout(() => resolve(false), BRIDGE_TIMEOUTS.botJoin);
+      
+      const handleMembership = (event, member) => {
+        if (member.roomId === room.room_id && 
+            member.userId === BRIDGE_CONFIGS[platform].bridgeBot && 
+            member.membership === 'join') {
+          clearTimeout(timeout);
+          matrixClient.removeListener('RoomMember.membership', handleMembership);
+          resolve(true);
+        }
+      };
+      
+      matrixClient.on('RoomMember.membership', handleMembership);
+    });
+
+    if (!botJoined) {
+      throw new Error(`${platform} bridge bot failed to join room`);
+    }
+
+    return room;
+  } catch (error) {
+    logger.error(`Failed to create bridge room for ${platform}:`, error);
+    throw error;
+  }
 }
 
 export async function handleWhatsAppBridge(matrixClient, userId) {
+  let bridgeState = BRIDGE_STATES.INITIALIZING;
+  let retryCount = 0;
+  const MAX_RETRIES = 3;
+
+  const updateBridgeState = async (state, error = null) => {
+    bridgeState = state;
+    await supabase
+      .from('bridge_states')
+      .upsert({ 
+        user_id: userId,
+        platform: 'whatsapp',
+        state,
+        error: error?.message,
+        updated_at: new Date().toISOString()
+      });
+    
+    ioEmitter.emit('bridge:state_change', {
+      userId,
+      platform: 'whatsapp',
+      state,
+      error: error?.message
+    });
+  };
+
   try {
+    await updateBridgeState(BRIDGE_STATES.INITIALIZING);
     const bridgeRoom = await createBridgeRoom(matrixClient, 'whatsapp');
     
     return new Promise((resolve, reject) => {
@@ -35,9 +84,18 @@ export async function handleWhatsAppBridge(matrixClient, userId) {
         matrixClient.removeListener('Room.timeline', handleResponse);
       };
 
-      const timeout = setTimeout(() => {
+      const timeout = setTimeout(async () => {
         cleanup();
-        reject(new Error('WhatsApp bridge timeout'));
+        if (retryCount < MAX_RETRIES) {
+          retryCount++;
+          logger.warn(`WhatsApp bridge timeout, retrying (${retryCount}/${MAX_RETRIES})`);
+          await updateBridgeState(BRIDGE_STATES.DISCONNECTED);
+          resolve(handleWhatsAppBridge(matrixClient, userId));
+        } else {
+          const error = new Error('WhatsApp bridge timeout after max retries');
+          await updateBridgeState(BRIDGE_STATES.ERROR, error);
+          reject(error);
+        }
       }, BRIDGE_TIMEOUTS.whatsapp);
 
       const handleResponse = async (event, room) => {
@@ -45,60 +103,44 @@ export async function handleWhatsAppBridge(matrixClient, userId) {
         if (event.getType() !== 'm.room.message') return;
 
         const content = event.getContent().body;
-        console.log('Bridge response:', content); // Debug log
+        logger.debug('Bridge response:', content);
 
-        // Check for QR code in response
-        if (content.includes(BRIDGE_CONFIGS.whatsapp.qrPrefix)) {
-          const qrCode = content.replace(BRIDGE_CONFIGS.whatsapp.qrPrefix, '').trim();
-          console.log('QR Code received, emitting to client'); // Debug log
-          ioEmitter.emit('whatsapp_qr', {
-            userId,
-            qrCode
-          });
-          return; // Don't resolve yet - wait for successful connection
-        }
-
-        // Check for successful connection
-        if (content.includes(BRIDGE_CONFIGS.whatsapp.connected)) {
-          console.log('WhatsApp successfully connected'); // Debug log
-          cleanup();
-          
-          const { error } = await supabase.from('accounts').upsert({
-            user_id: userId,
-            platform: 'whatsapp',
-            status: 'active',
-            credentials: {
-              bridge_room_id: bridgeRoom.room_id
-            },
-            connected_at: new Date().toISOString()
-          });
-
-          if (error) {
-            reject(error);
-            return;
+        // Check for QR code or connection status in response
+        if (content.includes('Scan this QR code')) {
+          await updateBridgeState(BRIDGE_STATES.WAITING_FOR_QR);
+          // Extract and emit QR code
+          const qrCode = content.match(/```([\s\S]+?)```/)?.[1];
+          if (qrCode) {
+            ioEmitter.emit('whatsapp:qr_code', { userId, qrCode });
           }
-
-          resolve({ 
-            status: 'connected',
-            bridgeRoomId: bridgeRoom.room_id 
-          });
+        } else if (content.includes('WhatsApp connection successful')) {
+          cleanup();
+          await updateBridgeState(BRIDGE_STATES.CONNECTED);
+          resolve(true);
+        } else if (content.includes('WhatsApp connection failed')) {
+          cleanup();
+          const error = new Error('WhatsApp connection failed');
+          await updateBridgeState(BRIDGE_STATES.ERROR, error);
+          reject(error);
         }
       };
 
-      // Start listening for responses
       matrixClient.on('Room.timeline', handleResponse);
-
-      // Send WhatsApp login command after a short delay to ensure room is ready
-      setTimeout(() => {
-        console.log('Sending WhatsApp login command'); // Debug log
-        matrixClient.sendMessage(bridgeRoom.room_id, {
-          msgtype: 'm.text',
-          body: BRIDGE_CONFIGS.whatsapp.loginCommand
-        });
-      }, 2000);
+      
+      // Send login command
+      matrixClient.sendTextMessage(
+        bridgeRoom.room_id,
+        BRIDGE_CONFIGS.whatsapp.loginCommand
+      ).catch(async (error) => {
+        cleanup();
+        logger.error('Failed to send WhatsApp login command:', error);
+        await updateBridgeState(BRIDGE_STATES.ERROR, error);
+        reject(error);
+      });
     });
   } catch (error) {
-    console.error('WhatsApp bridge initialization error:', error);
+    logger.error('WhatsApp bridge handler error:', error);
+    await updateBridgeState(BRIDGE_STATES.ERROR, error);
     throw error;
   }
 }

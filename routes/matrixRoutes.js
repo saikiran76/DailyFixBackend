@@ -77,7 +77,7 @@ router.post('/whatsapp/connect', authMiddleware, async (req, res) => {
 
 // Disconnect WhatsApp
 router.post('/whatsapp/disconnect', authMiddleware, async (req, res) => {
-  const { userId } = req.body;
+  const userId = req.user.id;
 
   try {
     const result = await matrixWhatsAppService.disconnectWhatsApp(userId);
@@ -93,7 +93,9 @@ router.post('/whatsapp/disconnect', authMiddleware, async (req, res) => {
 
 // Get WhatsApp connection status
 router.get('/whatsapp/status', authMiddleware, async (req, res) => {
-  const { userId } = req.query;
+  const userId = req.user.id;
+
+  console.log("Getting WhatsApp status for user:", userId);
 
   try {
     const result = await matrixWhatsAppService.getStatus(userId);
@@ -109,13 +111,22 @@ router.get('/whatsapp/status', authMiddleware, async (req, res) => {
 
 // Sync WhatsApp messages
 router.post('/whatsapp/sync', authMiddleware, async (req, res) => {
-  const { userId } = req.body;
+  const userId = req.user.id;
+  const { contactId } = req.body;
+
+  if (!contactId) {
+    return res.status(400).json({
+      status: 'error',
+      message: 'Contact ID is required'
+    });
+  }
 
   try {
-    const result = await matrixWhatsAppService.syncMessages(userId);
+    console.log('[Matrix Routes] Starting WhatsApp sync:', { userId, contactId });
+    const result = await matrixWhatsAppService.syncMessages(userId, contactId);
     res.json(result);
   } catch (error) {
-    console.error('WhatsApp message sync error:', error);
+    console.error('[Matrix Routes] WhatsApp message sync error:', error);
     res.status(500).json({
       status: 'error',
       message: error.message
@@ -135,6 +146,43 @@ router.get('/status', authMiddleware, async (req, res) => {
     });
   } catch (error) {
     console.error('Error checking Matrix status:', error);
+    res.status(500).json({
+      status: 'error',
+      message: error.message
+    });
+  }
+});
+
+// Add restore-session endpoint
+router.post('/restore-session', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { matrixUserId, accessToken, deviceId } = req.body;
+
+    if (!matrixUserId || !accessToken) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'Missing required fields: matrixUserId, accessToken'
+      });
+    }
+
+    console.log('Restoring Matrix session for user:', {
+      userId,
+      matrixUserId
+    });
+
+    const result = await matrixWhatsAppService.restoreSession({
+      userId,
+      matrixCredentials: {
+        userId: matrixUserId,
+        accessToken,
+        deviceId
+      }
+    });
+
+    res.json(result);
+  } catch (error) {
+    console.error('Matrix session restoration error:', error);
     res.status(500).json({
       status: 'error',
       message: error.message
@@ -276,7 +324,7 @@ router.post('/whatsapp/update-status', authMiddleware, async (req, res) => {
     }
 
     // Map the incoming status to the correct enum value
-    const accountStatus = status === 'connected' ? 'active' : 'inactive';
+    const accountStatus = bridgeRoomId ? 'active' : 'inactive';
 
     // First check if the account exists
     const { data: existingAccount, error: fetchError } = await adminClient

@@ -1,12 +1,12 @@
 export const BRIDGE_CONFIGS = {
   whatsapp: {
-    bridgeBot: '@whatsappbot:example-mtbr.duckdns.org',
+    bridgeBot: '@whatsappbot:matrix.org',
     loginCommand: '!wa login',
     logoutCommand: '!wa logout',
     syncCommand: '!wa sync',
-    qrPrefix: 'QR code:',
-    successMessage: 'Successfully logged in',
-    connected: 'Successfully logged in',
+    qrPrefix: 'Scan this QR code',
+    successMessage: 'WhatsApp connection successful',
+    errorMessage: 'WhatsApp connection failed',
     syncProgressPrefix: 'Sync progress:',
     syncErrorPrefix: 'Sync error:',
     syncCompleteMessage: 'Message synchronization completed',
@@ -26,6 +26,7 @@ export const BRIDGE_CONFIGS = {
 };
 
 export const BRIDGE_TIMEOUTS = {
+  botJoin: 30000,
   whatsapp: 300000,
   whatsappSync: 1800000,
   telegram: 30000,
@@ -34,10 +35,16 @@ export const BRIDGE_TIMEOUTS = {
 };
 
 export const BRIDGE_EVENTS = {
-  connected: 'Successfully logged in',
-  disconnected: 'Logged out',
-  error: 'Error:',
-  qrCode: 'Please scan the following QR code:',
+  INITIALIZING: 'initializing',
+  WAITING_FOR_QR: 'waiting_for_qr',
+  CONNECTED: 'connected',
+  DISCONNECTED: 'disconnected',
+  ERROR: 'error',
+  
+  connected: 'WhatsApp connection successful',
+  disconnected: 'WhatsApp disconnected',
+  error: 'WhatsApp connection failed',
+  qrCode: 'Scan this QR code',
   syncProgress: 'Sync progress:',
   syncError: 'Sync error:',
   syncComplete: 'Message synchronization completed'
