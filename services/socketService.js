@@ -89,134 +89,174 @@ const enhancedTrackEvent = (event, latency = 0, retryCount = 0) => {
   }
 };
 
-// Socket authentication middleware
-const authMiddleware = async (socket, next) => {
+const SOCKET_CONFIGS = {
+  CONNECT_TIMEOUT: 15000,
+  PING_INTERVAL: 25000,
+  PING_TIMEOUT: 5000,
+  MAX_RECONNECTION_ATTEMPTS: 5,
+  RECONNECTION_DELAY: 1000,
+  MAX_RECONNECTION_DELAY: 5000,
+  DEVELOPMENT_MODE: process.env.NODE_ENV !== 'production'
+};
+
+// Monitor system resources
+const monitorResources = () => {
   try {
-    const token = socket.handshake.auth.token;
-    if (!token) {
-      return next(new SocketError('auth', 'No token provided'));
-    }
-
-    const tokenData = await tokenService.getValidToken();
-    if (!tokenData || tokenData.access_token !== token) {
-      return next(new SocketError('auth', 'Invalid token'));
-    }
-
-    socket.userId = tokenData.userId;
-    socket.tokenData = tokenData;
-
-    // Subscribe to token updates
-    socket.tokenUnsubscribe = tokenService.subscribe((newTokenData) => {
-      socket.tokenData = newTokenData;
-      socket.emit('token:refresh', { token: newTokenData.access_token });
-    });
-
-    next();
+    const usage = process.memoryUsage();
+    enhancedMetrics.resourceUsage.memory.set('heapUsed', usage.heapUsed);
+    enhancedMetrics.resourceUsage.memory.set('heapTotal', usage.heapTotal);
+    enhancedMetrics.resourceUsage.memory.set('rss', usage.rss);
+    
+    // CPU usage (percentage of time spent in CPU out of total time)
+    const startTime = process.hrtime();
+    const startUsage = process.cpuUsage();
+    
+    setTimeout(() => {
+      const elapsedTime = process.hrtime(startTime);
+      const elapsedUsage = process.cpuUsage(startUsage);
+      
+      const totalTime = (elapsedTime[0] * 1e9 + elapsedTime[1]) / 1e6; // ms
+      const cpuTime = (elapsedUsage.user + elapsedUsage.system) / 1000; // ms
+      
+      const cpuPercent = (cpuTime / totalTime) * 100;
+      enhancedMetrics.resourceUsage.cpu.set('percentage', cpuPercent);
+    }, 100);
   } catch (error) {
-    logger.error('Socket authentication error:', error);
-    next(new SocketError('auth', 'Authentication failed'));
+    logger.error('Error monitoring resources:', error);
   }
 };
 
-// Performance monitoring
-const trackPerformance = (operation, duration) => {
-  const metrics = enhancedMetrics.performance.responseTime.get(operation) || {
-    count: 0,
-    total: 0,
-    min: Infinity,
-    max: -Infinity
-  };
+class SocketService {
+  constructor() {
+    this.io = null;
+    this.connections = new Map();
+    this.healthChecks = new Map();
+    this.initialized = false;
+    this.monitoringInterval = null;
+  }
 
-  metrics.count++;
-  metrics.total += duration;
-  metrics.min = Math.min(metrics.min, duration);
-  metrics.max = Math.max(metrics.max, duration);
-  metrics.average = metrics.total / metrics.count;
-
-  enhancedMetrics.performance.responseTime.set(operation, metrics);
-};
-
-// Resource monitoring
-const monitorResources = () => {
-  const usage = process.memoryUsage();
-  enhancedMetrics.resourceUsage.memory.set(Date.now(), {
-    heapUsed: usage.heapUsed,
-    heapTotal: usage.heapTotal,
-    external: usage.external,
-    rss: usage.rss
-  });
-};
-
-// Circuit breaker for Redis operations
-const createRedisCircuitBreaker = (operation) => {
-  const breaker = new CircuitBreaker(operation, CIRCUIT_BREAKER_OPTIONS);
-  
-  breaker.fallback(() => {
-    logger.warn(`[Socket Service] Circuit breaker fallback for Redis operation`);
-    return null;
-  });
-
-  breaker.on('success', () => {
-    logger.debug(`[Socket Service] Redis operation succeeded`);
-  });
-
-  breaker.on('failure', (error) => {
-    logger.error(`[Socket Service] Redis operation failed:`, error);
-  });
-
-  breaker.on('open', () => {
-    logger.error(`[Socket Service] Circuit breaker opened for Redis operations`);
-    ioEmitter.emit('system:alert', {
-      type: 'circuit_breaker',
-      status: 'open',
-      service: 'redis'
-    });
-  });
-
-  return breaker;
-};
-
-export async function initializeSocketServer(server) {
-  try {
-    // Initialize Redis service
-    await redisClient.connect();
-
-    const io = new Server(server, socketConfig);
-    
-    // Create Redis adapter using our Redis service
-    io.adapter(createAdapter(redisClient.pubClient, redisClient.subClient));
-
-    // Enhanced Redis error handling and monitoring
-    redisClient.pubClient.on('error', (err) => {
-      logger.error('Redis Pub Client Error:', {
-        error: err,
-        stack: err?.stack,
-        timestamp: new Date().toISOString()
+  async initialize(server) {
+    try {
+      logger.info('[Socket] Initializing socket service...');
+      
+      this.io = new Server(server, {
+        pingInterval: SOCKET_CONFIGS.PING_INTERVAL,
+        pingTimeout: SOCKET_CONFIGS.PING_TIMEOUT,
+        connectTimeout: SOCKET_CONFIGS.CONNECT_TIMEOUT,
+        reconnection: true,
+        reconnectionAttempts: SOCKET_CONFIGS.MAX_RECONNECTION_ATTEMPTS,
+        reconnectionDelay: SOCKET_CONFIGS.RECONNECTION_DELAY,
+        reconnectionDelayMax: SOCKET_CONFIGS.MAX_RECONNECTION_DELAY,
+        cors: {
+          origin: process.env.FRONTEND_URL || 'http://localhost:5173',
+          methods: ['GET', 'POST'],
+          credentials: true
+        }
       });
-      
-      healthCheck.isConnected = false;
-      healthCheck.addError(err);
-      
-      // Track error metrics
-      enhancedMetrics.errors.set('redis_pub', (enhancedMetrics.errors.get('redis_pub') || 0) + 1);
-      
-      ioEmitter.emit('system:status', {
-        type: 'redis',
-        status: 'error',
-        message: 'Redis connection error',
-        timestamp: Date.now()
-      });
-    });
 
+      // Set up Redis adapter
+      this.io.adapter(createAdapter(redisClient.pubClient, redisClient.subClient));
+
+      // Enhanced Redis error handling
+      redisClient.pubClient.on('error', (err) => {
+        logger.error('Redis Pub Client Error:', {
+          error: err,
+          stack: err?.stack,
+          timestamp: new Date().toISOString()
+        });
+        enhancedTrackError(err, { type: 'redis_pub' });
+      });
+
+      // Start monitoring
+      this.startMonitoring();
+      
+      // Enhanced authentication middleware
+      this.io.use(async (socket, next) => {
+        try {
+          const token = socket.handshake.auth.token;
+          
+          if (!token) {
+            if (SOCKET_CONFIGS.DEVELOPMENT_MODE) {
+              logger.warn('[Socket] No token provided, allowing in development mode');
+              socket.userId = 'anonymous';
+              socket.userData = { anonymous: true };
+              return next();
+            }
+            return next(new Error('Authentication token required'));
+          }
+
+          try {
+            const { data: { user }, error } = await adminClient.auth.getUser(token);
+            
+            if (error || !user) {
+              if (SOCKET_CONFIGS.DEVELOPMENT_MODE) {
+                logger.warn('[Socket] Invalid token, allowing in development mode');
+                socket.userId = 'anonymous';
+                socket.userData = { anonymous: true };
+                return next();
+              }
+              return next(new Error('Invalid authentication token'));
+            }
+
+            // Valid user authentication
+            socket.userId = user.id;
+            socket.userData = user;
+            this.trackConnection(socket);
+            
+            logger.info('[Socket] User authenticated successfully:', {
+              userId: user.id,
+              socketId: socket.id
+            });
+            
+            next();
+          } catch (authError) {
+            logger.error('[Socket] Authentication error:', authError);
+            if (SOCKET_CONFIGS.DEVELOPMENT_MODE) {
+              socket.userId = 'anonymous';
+              socket.userData = { anonymous: true };
+              return next();
+            }
+            next(new Error('Authentication failed'));
+          }
+        } catch (error) {
+          logger.error('[Socket] Critical socket error:', error);
+          next(new Error('Internal server error'));
+        }
+      });
+
+      // Set up connection handling
+      this.io.on('connection', (socket) => {
+        this.setupSocketHandlers(socket);
+        logger.info('[Socket] New connection established:', {
+          socketId: socket.id,
+          userId: socket.userId
+        });
+      });
+
+      this.initialized = true;
+      logger.info('[Socket] Socket service initialized successfully');
+      
+      return this;
+    } catch (error) {
+      logger.error('[Socket] Failed to initialize socket service:', {
+        error: error.message,
+        stack: error.stack
+      });
+      throw error;
+    }
+  }
+
+  startMonitoring() {
     // Start resource monitoring
-    setInterval(monitorResources, 60000);
+    monitorResources(); // Initial monitoring
+    this.monitoringInterval = setInterval(monitorResources, 60000);
 
-    // Enhanced metrics collection
+    // Start metrics collection
     setInterval(async () => {
       try {
         const timestamp = Date.now();
         const metricsData = {
-          activeConnections: enhancedMetrics.connections.size,
+          activeConnections: this.connections.size,
           eventCounts: Object.fromEntries(enhancedMetrics.events),
           errorCounts: Object.fromEntries(enhancedMetrics.errors),
           performance: {
@@ -227,84 +267,110 @@ export async function initializeSocketServer(server) {
             memory: Object.fromEntries(enhancedMetrics.resourceUsage.memory),
             cpu: Object.fromEntries(enhancedMetrics.resourceUsage.cpu)
           },
-          circuitBreakers: Array.from(enhancedMetrics.circuitBreakers.entries()).map(([name, breaker]) => ({
-            name,
-            state: breaker.opened ? 'open' : 'closed',
-            failures: breaker.stats.failures,
-            successes: breaker.stats.successes,
-            fallbacks: breaker.stats.fallbacks
-          })),
           timestamp
         };
 
-        // Store metrics using Redis service
         await redisClient.publish('socket:metrics', JSON.stringify(metricsData));
       } catch (error) {
         logger.error('Error collecting metrics:', error);
       }
     }, 30000);
+  }
 
-    // Socket middleware for authentication
-    io.use(authMiddleware);
+  async cleanup() {
+    try {
+      if (this.io) {
+        // Stop monitoring
+        if (this.monitoringInterval) {
+          clearInterval(this.monitoringInterval);
+          this.monitoringInterval = null;
+        }
 
-    // Connection handling
-    io.on('connection', async (socket) => {
-      try {
-        const userId = socket.userId;
-        logger.info(`[Socket Service] Client connected:`, {
-          userId,
-          socketId: socket.id
-        });
-
-        // Track connection
-        enhancedMetrics.connections.set(socket.id, {
-          userId,
-          connectedAt: Date.now()
-        });
-
-        // Join user's room for targeted events
-        socket.join(`user:${userId}`);
-
-        // Set up WhatsApp handlers
-        setupWhatsAppHandlers(io, socket);
-
-        // Handle disconnection
-        socket.on('disconnect', async () => {
-          try {
-            // Clean up token subscription
-            if (socket.tokenUnsubscribe) {
-              socket.tokenUnsubscribe();
-            }
-
-            // Remove from metrics
-            enhancedMetrics.connections.delete(socket.id);
-
-            logger.info(`[Socket Service] Client disconnected:`, {
-              userId,
-              socketId: socket.id
-            });
-          } catch (error) {
-            logger.error('[Socket Service] Error handling disconnect:', error);
-          }
-        });
-
-        // Handle errors
-        socket.on('error', (error) => {
-          enhancedTrackError(error, {
-            userId,
-            socketId: socket.id
+        // Close all connections
+        const sockets = await this.io.fetchSockets();
+        await Promise.all(sockets.map(socket => socket.disconnect(true)));
+        
+        // Close the server
+        await new Promise((resolve) => {
+          this.io.close(() => {
+            logger.info('[Socket] Socket.IO server closed');
+            resolve();
           });
         });
+        
+        this.io = null;
+        this.connections.clear();
+        this.healthChecks.clear();
+        this.initialized = false;
+      }
+    } catch (error) {
+      logger.error('[Socket] Error during cleanup:', error);
+      throw error;
+    }
+  }
 
-      } catch (error) {
-        logger.error('[Socket Service] Error handling connection:', error);
-        socket.disconnect(true);
+  trackConnection(socket) {
+    const userId = socket.userId;
+    if (!this.connections.has(userId)) {
+      this.connections.set(userId, new Set());
+    }
+    this.connections.get(userId).add(socket.id);
+
+    // Setup cleanup on disconnect
+    socket.on('disconnect', () => {
+      const userConnections = this.connections.get(userId);
+      if (userConnections) {
+        userConnections.delete(socket.id);
+        if (userConnections.size === 0) {
+          this.connections.delete(userId);
+        }
       }
     });
-
-    return io;
-  } catch (error) {
-    logger.error('Failed to initialize socket server:', error);
-    throw error;
   }
+
+  setupSocketHandlers(socket) {
+    // Handle ping manually for better connection monitoring
+    socket.on('ping', () => {
+      socket.emit('pong');
+      this.updateLastActivity(socket);
+    });
+
+    // Handle errors
+    socket.on('error', (error) => {
+      logger.error('[Socket] Client error:', {
+        userId: socket.userId,
+        socketId: socket.id,
+        error: error.message
+      });
+    });
+
+    // Handle reconnection
+    socket.on('reconnect_attempt', (attempt) => {
+      logger.info('[Socket] Reconnection attempt:', {
+        userId: socket.userId,
+        socketId: socket.id,
+        attempt
+      });
+    });
+
+    // Handle successful reconnection
+    socket.on('reconnect', () => {
+      logger.info('[Socket] Reconnected successfully:', {
+        userId: socket.userId,
+        socketId: socket.id
+      });
+      this.updateLastActivity(socket);
+    });
+  }
+
+  updateLastActivity(socket) {
+    const key = `socket:activity:${socket.id}`;
+    redisClient.pubClient.set(key, Date.now(), 'EX', 300); // Store for 5 minutes
+  }
+}
+
+// Export a function that creates and initializes a socket service instance
+export async function initializeSocketServer(server) {
+  const socketService = new SocketService();
+  return socketService.initialize(server);
 } 

@@ -16,7 +16,7 @@ export const adminClient = createClient(
   {
     auth: {
       autoRefreshToken: false,
-      persistSession: false
+      persistSession: true
     }
   }
 );

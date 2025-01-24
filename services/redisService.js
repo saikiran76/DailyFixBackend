@@ -16,35 +16,55 @@ class RedisService {
     this.client = null;
     this.pubClient = null;
     this.subClient = null;
-    this.isConnected = false;
+    this._isConnected = false;
     this.connectionPromise = null;
     this.subscribers = new Map();
   }
 
+  getConnectionStatus() {
+    return this._isConnected;
+  }
+
   async connect() {
+    if (this._isConnected) {
+      logger.info('Redis already connected');
+      return true;
+    }
+
     if (this.connectionPromise) {
       return this.connectionPromise;
     }
 
     this.connectionPromise = new Promise((resolve, reject) => {
       try {
-        this.client = new Redis(REDIS_CONFIG);
-        this.pubClient = new Redis(REDIS_CONFIG);
-        this.subClient = new Redis(REDIS_CONFIG);
+        // Create new clients only if they don't exist
+        if (!this.client) this.client = new Redis(REDIS_CONFIG);
+        if (!this.pubClient) this.pubClient = new Redis(REDIS_CONFIG);
+        if (!this.subClient) this.subClient = new Redis(REDIS_CONFIG);
+
+        let connectedClients = 0;
+        const totalClients = 3;
 
         const setupClient = (client, role) => {
           client.on('connect', () => {
             logger.info(`Redis ${role} Client Connected`);
+            connectedClients++;
+            if (connectedClients === totalClients) {
+              this._isConnected = true;
+              logger.info('All Redis clients connected successfully');
+              resolve(true);
+            }
           });
 
           client.on('error', (error) => {
             logger.error(`Redis ${role} Client Error:`, error);
-            this.isConnected = false;
+            this._isConnected = false;
           });
 
           client.on('close', () => {
             logger.warn(`Redis ${role} Client Closed`);
-            this.isConnected = false;
+            this._isConnected = false;
+            connectedClients = Math.max(0, connectedClients - 1);
           });
         };
 
@@ -52,18 +72,20 @@ class RedisService {
         setupClient(this.pubClient, 'Pub');
         setupClient(this.subClient, 'Sub');
 
-        this.client.on('ready', () => {
-          this.isConnected = true;
-          resolve(true);
-        });
-
       } catch (error) {
+        this._isConnected = false;
         logger.error('Redis Connection Error:', error);
         reject(error);
       }
     });
 
-    return this.connectionPromise;
+    try {
+      await this.connectionPromise;
+      return true;
+    } catch (error) {
+      this.connectionPromise = null;
+      throw error;
+    }
   }
 
   async ping() {
@@ -150,15 +172,21 @@ class RedisService {
   }
 
   async disconnect() {
+    if (!this._isConnected) {
+      return;
+    }
+
     try {
-      await Promise.all([
-        this.client?.disconnect(),
-        this.pubClient?.disconnect(),
-        this.subClient?.disconnect()
-      ]);
-      this.isConnected = false;
+      const clients = [this.client, this.pubClient, this.subClient].filter(Boolean);
+      await Promise.all(clients.map(client => client.disconnect()));
+      
+      this.client = null;
+      this.pubClient = null;
+      this.subClient = null;
+      this._isConnected = false;
       this.connectionPromise = null;
       this.subscribers.clear();
+      
       logger.info('Redis clients disconnected successfully');
     } catch (error) {
       logger.error('Redis Disconnect Error:', error);

@@ -3,6 +3,7 @@ import { authenticateUser } from '../middleware/auth.js';
 import { whatsappEntityService } from '../services/whatsappEntityService.js';
 import { validateRequest } from '../middleware/validation.js';
 import { adminClient } from '../utils/supabase.js';
+import logger from '../utils/logger.js';
 
 const router = express.Router();
 
@@ -206,22 +207,11 @@ router.get('/contacts', async (req, res) => {
     const userId = req.user.id;
     console.log('[Contacts] Fetching contacts for user:', userId);
 
-    // Get cached contacts first for immediate response
-    const cachedContacts = await whatsappEntityService.getCachedContacts(userId);
+    // Get contacts with built-in caching
+    const contacts = await whatsappEntityService.getContacts(userId, { forceSync: false });
     
-    // Start background sync if needed
-    const lastSyncTime = await whatsappEntityService.getLastContactSyncTime(userId);
-    const SYNC_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes
-    
-    if (!lastSyncTime || Date.now() - lastSyncTime > SYNC_THRESHOLD_MS) {
-      console.log('[Contacts] Starting background sync for user:', userId);
-      whatsappEntityService.syncContacts(userId).catch(error => {
-        console.error('[Contacts] Background sync failed:', error);
-      });
-    }
-
     // Transform contacts for consistent response
-    const transformedContacts = (cachedContacts || []).map(contact => {
+    const transformedContacts = (contacts || []).map(contact => {
       // Extract priority-related fields from metadata if they exist
       const priorityInfo = contact.metadata?.priority_info || {};
       
@@ -240,23 +230,16 @@ router.get('/contacts', async (req, res) => {
       };
     });
 
-    return res.json({
+    res.json({
       status: 'success',
-      data: transformedContacts,
-      meta: {
-        sync_info: {
-          last_sync: lastSyncTime,
-          is_syncing: lastSyncTime === null
-        }
-      }
+      data: transformedContacts
     });
-
   } catch (error) {
     console.error('[Contacts] Error fetching contacts:', error);
-    return res.status(500).json({
+    res.status(500).json({
       status: 'error',
       message: 'Failed to fetch contacts',
-      details: error.message
+      error: error.message
     });
   }
 });

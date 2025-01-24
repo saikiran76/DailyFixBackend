@@ -7,6 +7,7 @@ import session from 'express-session';
 import dotenv from 'dotenv';
 import helmet from 'helmet';
 import compression from 'compression';
+import RedisStore from 'connect-redis';
 
 // Import logger first as it's used by other services
 import logger from './utils/logger.js';
@@ -55,21 +56,8 @@ const supabase = createClient(
   process.env.SUPABASE_ANON_KEY
 );
 
-// Define cleanup function at the top level
-const cleanup = async () => {
-  logger.info('Starting cleanup...');
-  try {
-    await Promise.all([
-      redisClient.disconnect(),
-      databaseService.cleanup()
-    ]);
-    logger.info('Cleanup completed');
-    process.exit(0);
-  } catch (error) {
-    logger.error('Error during cleanup:', error);
-    process.exit(1);
-  }
-};
+// Declare socketServer at the top level for access in cleanup
+let socketServer = null;
 
 // Global error handlers
 process.on('unhandledRejection', (reason, promise) => {
@@ -96,6 +84,7 @@ process.on('uncaughtException', (error) => {
 
 // Initialize Express app
 const app = express();
+const server = http.createServer(app);
 
 // Apply security middleware
 app.use(helmet());
@@ -114,33 +103,132 @@ app.use(cors({
 app.use(express.json());
 app.use(cookieParser());
 
-// Configure session with Redis
-import RedisStore from 'connect-redis';
+// Initialize core services
+async function initializeServices() {
+  try {
+    logger.info('Initializing core services...');
 
-// Initialize Redis before setting up session
-await redisClient.connect();
+    // Initialize Redis first (if not already connected)
+    if (!redisClient.getConnectionStatus()) {
+      await redisClient.connect();
+      logger.info('Redis service initialized');
+    }
 
-app.use(session({
-  store: new RedisStore({ 
-    client: redisClient.client, // Use the client property directly
-    prefix: 'sess:'
-  }),
-  secret: process.env.SESSION_SECRET || 'your-secret-key',
-  resave: false,
-  saveUninitialized: false,
-  name: 'dailyfix.sid',
-  cookie: {
-    secure: process.env.NODE_ENV === 'production',
-    httpOnly: true,
-    sameSite: 'lax',
-    maxAge: 24 * 60 * 60 * 1000 // 24 hours
+    // Configure session with Redis
+    app.use(session({
+      store: new RedisStore({ 
+        client: redisClient.client,
+        prefix: 'sess:'
+      }),
+      secret: process.env.SESSION_SECRET || 'your-secret-key',
+      resave: false,
+      saveUninitialized: false,
+      name: 'dailyfix.sid',
+      cookie: {
+        secure: process.env.NODE_ENV === 'production',
+        httpOnly: true,
+        sameSite: 'lax',
+        maxAge: 24 * 60 * 60 * 1000 // 24 hours
+      }
+    }));
+
+    // Initialize token service with graceful degradation
+    await tokenService.initialize();
+    logger.info('Token service initialized:', { 
+      hasActiveSession: !!tokenService.activeSession 
+    });
+
+    // Initialize socket service
+    try {
+      socketServer = await initializeSocketServer(server);
+      if (!socketServer) {
+        throw new Error('Socket server initialization returned null');
+      }
+      logger.info('Socket service initialized successfully');
+    } catch (socketError) {
+      logger.error('Failed to initialize socket server:', {
+        error: socketError.message,
+        stack: socketError.stack
+      });
+      throw socketError;
+    }
+
+    // Start server
+    await new Promise((resolve, reject) => {
+      server.listen(port, (err) => {
+        if (err) {
+          reject(err);
+          return;
+        }
+        logger.info(`Server is running on port ${port}`);
+        resolve();
+      });
+    });
+
+    return true;
+  } catch (error) {
+    logger.error('Failed to initialize services:', {
+      error: error.message,
+      stack: error.stack
+    });
+    await cleanup();
+    throw error;
   }
-}));
+}
+
+// Consolidated cleanup function
+async function cleanup() {
+  logger.info('Starting cleanup...');
+  try {
+    // Cleanup socket service first
+    if (socketServer) {
+      try {
+        await socketServer.cleanup();
+        logger.info('Socket service cleaned up');
+      } catch (socketError) {
+        logger.error('Error cleaning up socket service:', {
+          error: socketError.message,
+          stack: socketError.stack
+        });
+      }
+    }
+    
+    // Cleanup token service
+    if (tokenService) {
+      try {
+        tokenService.destroy();
+        logger.info('Token service cleaned up');
+      } catch (tokenError) {
+        logger.error('Error cleaning up token service:', {
+          error: tokenError.message,
+          stack: tokenError.stack
+        });
+      }
+    }
+    
+    // Disconnect Redis clients last
+    try {
+      await redisClient.disconnect();
+      logger.info('Redis clients disconnected successfully');
+    } catch (redisError) {
+      logger.error('Error disconnecting Redis clients:', {
+        error: redisError.message,
+        stack: redisError.stack
+      });
+    }
+    
+    logger.info('Cleanup completed');
+  } catch (error) {
+    logger.error('Error during cleanup:', {
+      error: error.message,
+      stack: error.stack
+    });
+    throw error;
+  }
+}
 
 // Apply custom middleware
 app.use(requestHandler);
-
-const server = http.createServer(app);
 
 // Health check endpoint
 app.get('/health', async (req, res) => {
@@ -164,8 +252,8 @@ app.get('/health', async (req, res) => {
         }
       },
       tokenService: {
-        valid: false,
-        status: 'initializing',
+        valid: tokenService.initialized,
+        status: tokenService.initialized ? 'ready' : 'initializing',
         lastCheck: new Date().toISOString()
       },
       bridges: {}
@@ -181,104 +269,6 @@ app.get('/health', async (req, res) => {
     });
   }
 });
-
-// Initialize core services
-async function initializeServices() {
-  try {
-    logger.info('Initializing core services...');
-
-    // Initialize Redis
-    await redisClient.connect();
-    logger.info('Redis service initialized');
-
-    // Initialize token service and verify it has a valid session
-    const tokenData = await tokenService.getValidToken();
-    if (!tokenData) {
-      logger.warn('Token service initialized without active session');
-    } else {
-      logger.info('Token service initialized with valid session');
-    }
-
-    // Initialize Socket.IO with Redis adapter
-    const io = await initializeSocketServer(server);
-    logger.info('Socket.IO service initialized');
-
-    // Verify database connection
-    const dbHealth = await databaseService.healthCheck();
-    if (!dbHealth.healthy) {
-      throw new Error('Database health check failed');
-    }
-    logger.info('Database connection verified');
-
-    // Initialize database tables
-    console.log('Initializing database tables...');
-    await databaseService.initializeTables();
-    console.log('Database initialization completed successfully');
-    logger.info('Database tables initialized');
-
-    // Initialize Matrix clients and bridges
-    const { data: matrixAccounts, error } = await supabase
-      .from('accounts')
-      .select('*')
-      .eq('platform', 'matrix')
-      .eq('status', 'active');
-
-    if (error) throw error;
-    
-    if (matrixAccounts && matrixAccounts.length > 0) {
-      for (const account of matrixAccounts) {
-        const { credentials } = account;
-        await initializeMatrixClient(credentials.accessToken, credentials.userId);
-        logger.info(`Matrix client initialized for user: ${account.user_id}`);
-      }
-    }
-
-    // Start WhatsApp sync job service
-    console.log('Starting WhatsApp sync job service');
-    await startWhatsAppSyncJob();
-    logger.info('WhatsApp sync job service initialized');
-
-    // Start server
-    server.listen(port, () => {
-      logger.info(`Server running on port ${port}`);
-      
-      // 5. Emit server ready event
-      io.emit('system:status', {
-        type: 'server',
-        status: 'ready',
-        timestamp: new Date().toISOString()
-      });
-    });
-
-    // Set up cleanup on process exit
-    process.on('SIGTERM', cleanup);
-    process.on('SIGINT', cleanup);
-
-    // Schedule periodic health checks
-    const healthCheckInterval = setInterval(async () => {
-      try {
-        const health = await checkSystemHealth();
-        if (!health.healthy) {
-          logger.warn('System health check failed:', health);
-        }
-      } catch (error) {
-        logger.error('Health check error:', error);
-      }
-    }, 30000).unref(); // Don't prevent process exit
-
-    // Cleanup health check on shutdown
-    const cleanupHealthCheck = () => {
-      clearInterval(healthCheckInterval);
-    };
-    process.on('SIGTERM', cleanupHealthCheck);
-    process.on('SIGINT', cleanupHealthCheck);
-
-  } catch (error) {
-    logger.error('Failed to initialize services:', error);
-    await cleanup();
-    process.exit(1);
-  }
-}
 
 // Add routes
 app.use('/auth', authRoutes);

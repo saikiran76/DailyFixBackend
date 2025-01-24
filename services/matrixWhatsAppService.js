@@ -133,6 +133,14 @@ const tokenLimiter = new RateLimit({
   namespace: 'token-refresh'
 });
 
+const SYNC_CONFIGS = {
+  INITIAL_TIMEOUT: 60000,  // 60 seconds for initial sync
+  INCREMENTAL_TIMEOUT: 30000,  // 30 seconds for incremental syncs
+  MAX_RETRIES: 5,
+  BASE_BACKOFF: 2000,
+  MAX_BACKOFF: 32000
+};
+
 class MatrixWhatsAppService {
   constructor() {
     this.matrixClients = new Map();
@@ -149,34 +157,308 @@ class MatrixWhatsAppService {
     this.reconnectAttempts = new Map();
     this.HEALTH_CHECK_INTERVAL = 30000; // 30 seconds
     
-    // Add error tracking
-    this.errorCounts = new Map();
-    this.lastErrors = new Map();
-    this.errorThresholds = {
-      RATE_LIMIT: 5,
-      AUTH: 3,
-      NETWORK: 10,
-      SYNC: 5
-    };
-    
-    // Use initialized rate limiters
-    this.syncLimiter = syncLimiter;
-    this.tokenLimiter = tokenLimiter;
-
-    // Connection pool management
+    // Enhanced connection pool management
     this.connectionPool = {
       active: new Map(),
       idle: new Map(),
-      MAX_IDLE: 10,
       MAX_ACTIVE: 100,
-      IDLE_TIMEOUT: 300000 // 5 minutes
+      MAX_IDLE: 10,
+      IDLE_TIMEOUT: 300000, // 5 minutes
+      cleanupInterval: 60000 // 1 minute
     };
 
-    // Start pool maintenance
-    this.startPoolMaintenance();
+    // Enhanced error tracking with thresholds
+    this.errorTracking = {
+      counts: new Map(),
+      thresholds: {
+        RATE_LIMIT: 5,
+        AUTH: 3,
+        NETWORK: 10,
+        SYNC: 5
+      },
+      resetInterval: 3600000 // 1 hour
+    };
 
-    // Add redlock
-    this.redisLock = redlock;
+    // Initialize rate limiters
+    this.syncLimiter = syncLimiter;
+    this.tokenLimiter = tokenLimiter;
+
+    // Initialize redlock with error handling
+    try {
+      if (!pubClient.isReady) {
+        logger.warn('[Matrix Service] Redis client not ready, redlock will be initialized later');
+        this.redlock = null;
+      } else {
+        this.redlock = new Redlock([pubClient], {
+          driftFactor: 0.01,
+          retryCount: 3,
+          retryDelay: 200,
+          retryJitter: 200
+        });
+        logger.info('[Matrix Service] Redlock initialized successfully');
+      }
+    } catch (error) {
+      logger.error('[Matrix Service] Failed to initialize redlock:', error);
+      this.redlock = null;
+    }
+
+    // Start maintenance tasks
+    this.startMaintenanceTasks();
+  }
+
+  async startMaintenanceTasks() {
+    // Connection pool cleanup
+    setInterval(() => this.cleanupConnections(), this.connectionPool.cleanupInterval);
+    
+    // Error count reset
+    setInterval(() => this.resetErrorCounts(), this.errorTracking.resetInterval);
+    
+    // Health check for active connections
+    setInterval(() => this.checkConnectionHealth(), this.HEALTH_CHECK_INTERVAL);
+  }
+
+  async cleanupConnections() {
+    const now = Date.now();
+    
+    // Cleanup idle connections
+    for (const [userId, conn] of this.connectionPool.idle.entries()) {
+      if (now - conn.lastUsed > this.connectionPool.IDLE_TIMEOUT) {
+        await this.closeConnection(userId, conn);
+        this.connectionPool.idle.delete(userId);
+      }
+    }
+
+    // Move inactive connections to idle pool
+    for (const [userId, conn] of this.connectionPool.active.entries()) {
+      if (now - conn.lastUsed > this.connectionPool.IDLE_TIMEOUT / 2) {
+        this.connectionPool.active.delete(userId);
+        this.connectionPool.idle.set(userId, {
+          ...conn,
+          lastUsed: now
+        });
+      }
+    }
+  }
+
+  async checkConnectionHealth() {
+    try {
+      // Check active connections
+      for (const [userId, conn] of this.connectionPool.active.entries()) {
+        try {
+          const isHealthy = await this.verifyConnection(userId, conn);
+          if (!isHealthy) {
+            logger.warn('[Matrix Service] Unhealthy connection detected:', { userId });
+            await this.handleUnhealthyConnection(userId, conn);
+          }
+        } catch (error) {
+          logger.error('[Matrix Service] Health check failed for user:', {
+            userId,
+            error: error.message
+          });
+        }
+      }
+
+      // Check idle connections periodically
+      const now = Date.now();
+      if (now % (this.HEALTH_CHECK_INTERVAL * 2) === 0) {
+        for (const [userId, conn] of this.connectionPool.idle.entries()) {
+          try {
+            const isHealthy = await this.verifyConnection(userId, conn);
+            if (!isHealthy) {
+              logger.warn('[Matrix Service] Removing unhealthy idle connection:', { userId });
+              await this.closeConnection(userId, conn);
+              this.connectionPool.idle.delete(userId);
+            }
+          } catch (error) {
+            logger.error('[Matrix Service] Idle connection health check failed:', {
+              userId,
+              error: error.message
+            });
+          }
+        }
+      }
+    } catch (error) {
+      logger.error('[Matrix Service] Connection health check error:', error);
+    }
+  }
+
+  async verifyConnection(userId, conn) {
+    try {
+      if (!conn?.client?.isRunning()) {
+        return false;
+      }
+
+      // Verify Matrix client is responsive
+      const whoami = await conn.client.whoami();
+      if (!whoami || whoami.user_id !== conn.client.getUserId()) {
+        return false;
+      }
+
+      // Check sync state
+      const syncState = this.syncStates.get(userId);
+      if (syncState === SYNC_STATES.ERROR || syncState === SYNC_STATES.OFFLINE) {
+        return false;
+      }
+
+      // Update last activity
+      conn.lastUsed = Date.now();
+      return true;
+    } catch (error) {
+      logger.error('[Matrix Service] Connection verification failed:', {
+        userId,
+        error: error.message
+      });
+      return false;
+    }
+  }
+
+  async handleUnhealthyConnection(userId, conn) {
+    try {
+      // Move to idle pool first
+      this.connectionPool.active.delete(userId);
+      
+      // Attempt reconnection
+      const attempts = this.reconnectAttempts.get(userId) || 0;
+      if (attempts < this.MAX_RECONNECT_ATTEMPTS) {
+        this.reconnectAttempts.set(userId, attempts + 1);
+        
+        // Wait before retry
+        await sleep(this.RECONNECT_DELAY * Math.pow(2, attempts));
+        
+        // Attempt to create new connection
+        const newConn = await this.createConnection(userId);
+        if (newConn) {
+          this.connectionPool.active.set(userId, {
+            client: newConn,
+            lastUsed: Date.now(),
+            status: 'active'
+          });
+          this.reconnectAttempts.delete(userId);
+          logger.info('[Matrix Service] Successfully reconnected:', { userId });
+          return;
+        }
+      }
+
+      // If reconnection fails or max attempts reached, cleanup
+      await this.closeConnection(userId, conn);
+      this.reconnectAttempts.delete(userId);
+      
+      // Notify about connection failure
+      ioEmitter.emit('matrix:connection:error', {
+        userId,
+        error: 'Connection health check failed',
+        timestamp: new Date().toISOString()
+      });
+    } catch (error) {
+      logger.error('[Matrix Service] Error handling unhealthy connection:', {
+        userId,
+        error: error.message
+      });
+    }
+  }
+
+  async closeConnection(userId, conn) {
+    try {
+      // Cleanup Matrix client
+      if (conn.client) {
+        conn.client.removeAllListeners();
+        await conn.client.stopClient();
+      }
+
+      // Clear associated resources
+      this.matrixClients.delete(userId);
+      this.connections.delete(userId);
+      this.syncStates.delete(userId);
+      this.messageHandlers.delete(userId);
+      
+      logger.info('[Matrix Service] Closed connection for user:', userId);
+    } catch (error) {
+      logger.error('[Matrix Service] Error closing connection:', {
+        userId,
+        error: error.message
+      });
+    }
+  }
+
+  async getConnection(userId) {
+    const lockKey = `connection:${userId}`;
+    let lock = null;
+
+    try {
+      // Acquire distributed lock
+      lock = await this.redlock.acquire([lockKey], 30000);
+
+      // Check active connections
+      let conn = this.connectionPool.active.get(userId);
+      if (conn?.client?.isRunning()) {
+        conn.lastUsed = Date.now();
+        return conn;
+      }
+
+      // Check idle connections
+      conn = this.connectionPool.idle.get(userId);
+      if (conn?.client?.isRunning()) {
+        this.connectionPool.idle.delete(userId);
+        conn.lastUsed = Date.now();
+        this.connectionPool.active.set(userId, conn);
+        return conn;
+      }
+
+      // Create new connection if under limits
+      if (this.connectionPool.active.size < this.connectionPool.MAX_ACTIVE) {
+        const newConn = await this.createConnection(userId);
+        this.connectionPool.active.set(userId, {
+          client: newConn,
+          lastUsed: Date.now(),
+          status: 'active'
+        });
+        return newConn;
+      }
+
+      throw new Error('Connection pool exhausted');
+
+    } finally {
+      if (lock) await lock.release();
+    }
+  }
+
+  async createConnection(userId) {
+    try {
+      // Get credentials from token service
+      const tokens = await tokenService.getValidToken(userId);
+      if (!tokens?.access_token) {
+        throw new Error('No valid token available');
+      }
+
+      // Initialize Matrix client with enhanced options
+      const client = sdk.createClient({
+        baseUrl: process.env.MATRIX_HOMESERVER_URL,
+        accessToken: tokens.access_token,
+        userId,
+        timeoutMs: 60000,
+        localTimeoutMs: 30000,
+        useAuthorizationHeader: true,
+        retryIf: async (attempt, error) => {
+          const recovery = await this.handleError(userId, error, {
+            attempt,
+            method: 'createConnection'
+          });
+          return recovery.shouldRetry;
+        }
+      });
+
+      // Start client with proper error handling
+      await this.startClient(userId, client);
+
+      return client;
+
+    } catch (error) {
+      logger.error('[Matrix Service] Failed to create connection:', {
+        userId,
+        error: error.message
+      });
+      throw error;
+    }
   }
 
   validateMatrixClient = async (userId) => {
@@ -292,61 +574,265 @@ class MatrixWhatsAppService {
 
   initialize = async ({ userId, credentials, authToken }) => {
     try {
-      logger.info('=== Starting Matrix Initialization ===');
+      // Track initialization state
+      this.updateConnectionState(userId, 'initializing');
       
-      // Validate input credentials
-      if (!credentials?.accessToken || !credentials?.userId) {
-        logger.error('[MatrixService] Invalid Matrix credentials provided');
-        throw new Error('M_INVALID_CREDENTIALS');
+      // Validate and prepare Matrix client
+      const client = await this.initializeClient(userId, credentials);
+      if (!client) {
+        throw new Error('Failed to initialize Matrix client');
       }
 
-      // Initialize Matrix client with proper credentials
-      const matrixClient = sdk.createClient({
-        baseUrl: credentials.homeserver || process.env.MATRIX_HOMESERVER_URL,
-        accessToken: credentials.accessToken,
-        userId: credentials.userId,
-        deviceId: credentials.deviceId,
-        timeoutMs: 60000,
-        localTimeoutMs: 30000,
-        validateCertificate: false
-      });
-
-      // Verify client can connect before storing
-      try {
-        await matrixClient.whoami();
-      } catch (error) {
-        logger.error('[MatrixService] Matrix client validation failed:', error);
-        throw new Error('M_VALIDATION_FAILED');
+      // Check for existing bridge room
+      let bridgeRoom = await this.getBridgeRoom(userId);
+      
+      // If no bridge room exists, handle bot invitation
+      if (!bridgeRoom) {
+        bridgeRoom = await this.handleBotInvite(userId, null);
+        if (!bridgeRoom) {
+          throw new Error('Failed to create bridge room');
+        }
       }
 
-      // Store client instance
-      this.matrixClients.set(userId, matrixClient);
+      // Validate bridge room state
+      const isValid = await this.validateBridgeRoomWithRetry(userId, bridgeRoom.roomId);
+      if (!isValid) {
+        throw new Error('Bridge room validation failed');
+      }
 
-      // Start client and wait for initial sync
-      await matrixClient.startClient({
-        initialSyncLimit: 10,
-        includeArchivedRooms: false
-      });
+      // Setup message sync and listeners
+      await this.setupMessageSync(userId, client);
+      await this.setupTimelineListeners(userId, client);
 
-      await new Promise((resolve, reject) => {
-        const timeout = setTimeout(() => {
-          reject(new Error('Initial sync timed out'));
-        }, 30000);
+      // Start health checks
+      this.startHealthCheck(userId, client);
 
-        matrixClient.once('sync', (state) => {
-          if (state === 'PREPARED') {
-            clearTimeout(timeout);
-            resolve();
-          }
-        });
-      });
+      // Update connection state
+      this.updateConnectionState(userId, 'ready');
 
-      logger.info('[MatrixService] Client initialized successfully for user:', userId);
-      return matrixClient;
+      return {
+        status: 'success',
+        bridgeRoomId: bridgeRoom.roomId
+      };
 
     } catch (error) {
-      logger.error('[MatrixService] Initialization failed:', error);
+      logger.error('[Matrix Service] Initialization failed:', {
+        userId,
+        error: error.message
+      });
+      
+      this.updateConnectionState(userId, 'error', error);
       throw error;
+    }
+  }
+
+  async connectWhatsApp(userId) {
+    try {
+      // Get Matrix client
+      const client = await this.getMatrixClientWithRetry(userId);
+      if (!client) {
+        throw new Error('Matrix client not available');
+      }
+
+      // Get or create bridge room
+      let bridgeRoom = await this.getBridgeRoom(userId);
+      if (!bridgeRoom) {
+        bridgeRoom = await this.handleBotInvite(userId);
+        if (!bridgeRoom) {
+          throw new Error('Failed to create bridge room');
+        }
+      }
+
+      // Setup connection tracking
+      const connectionKey = `whatsapp:${userId}`;
+      const connection = {
+        userId,
+        bridgeRoomId: bridgeRoom.roomId,
+        status: 'connecting',
+        startTime: Date.now(),
+        retryCount: 0
+      };
+
+      this.connections.set(connectionKey, connection);
+
+      // Setup event listeners for QR code and connection status
+      const cleanup = () => {
+        client.removeListener('Room.timeline', timelineHandler);
+        clearTimeout(setupTimeout);
+      };
+
+      const timelineHandler = (event, room) => {
+        if (room.roomId !== bridgeRoom.roomId) return;
+
+        const content = event.getContent();
+        const msgtype = content.msgtype;
+
+        if (msgtype === 'm.image' && content.body?.includes('QR code')) {
+          this.emitStatusUpdate(userId, 'qr_ready', bridgeRoom.roomId);
+        } else if (content.body?.includes('WhatsApp connection successful')) {
+          cleanup();
+          this.updateConnectionStatus(userId, 'connected', bridgeRoom.roomId);
+          this.startSyncProcess(userId);
+        } else if (content.body?.includes('WhatsApp connection failed')) {
+          cleanup();
+          this.updateConnectionStatus(userId, 'failed', bridgeRoom.roomId, {
+            error: 'Connection failed',
+            details: content.body
+          });
+        }
+      };
+
+      client.on('Room.timeline', timelineHandler);
+
+      // Set timeout for setup
+      const setupTimeout = setTimeout(() => {
+        cleanup();
+        this.updateConnectionStatus(userId, 'timeout', bridgeRoom.roomId);
+      }, 300000); // 5 minutes
+
+      // Start connection process
+      await this.sendBridgeCommand(client, bridgeRoom.roomId, 'start');
+
+      return bridgeRoom;
+
+    } catch (error) {
+      logger.error('[Matrix Service] WhatsApp connection failed:', {
+        userId,
+        error: error.message
+      });
+      
+      this.updateConnectionStatus(userId, 'error', null, {
+        error: error.message
+      });
+      
+      throw error;
+    }
+  }
+
+  async startSyncProcess(userId, options = {}) {
+    const retryCount = options.retryCount || 0;
+    const syncKey = `sync:${userId}`;
+
+    try {
+      // Initialize sync state
+      await this.updateSyncProgress(userId, {
+        state: 'initializing',
+        progress: 0,
+        startTime: Date.now()
+      });
+
+      // Get Matrix client
+      const client = await this.getMatrixClientWithRetry(userId);
+      if (!client) {
+        throw new Error('Matrix client not available');
+      }
+
+      // Try to get saved sync token
+      const savedToken = await this.getSavedSyncToken(userId);
+      
+      // Start client with appropriate sync options
+      await client.startClient({
+        initialSyncLimit: savedToken ? undefined : 10,
+        includeArchivedRooms: false,
+        lazyLoadMembers: true,
+        syncToken: savedToken
+      });
+
+      // Wait for sync with improved error handling
+      await this.waitForSync(userId, client, {
+        isInitial: !savedToken,
+        retryCount
+      });
+
+      // Update sync state on success
+      await this.updateSyncProgress(userId, {
+        state: 'ready',
+        progress: 100,
+        lastSync: Date.now()
+      });
+
+      return true;
+
+    } catch (error) {
+      const shouldRetry = retryCount < SYNC_CONFIGS.MAX_RETRIES;
+      
+      await this.updateSyncProgress(userId, {
+        state: shouldRetry ? 'retrying' : 'error',
+        error: error.message,
+        retryCount,
+        lastAttempt: Date.now()
+      });
+
+      if (shouldRetry) {
+        const backoff = Math.min(
+          SYNC_CONFIGS.BASE_BACKOFF * Math.pow(2, retryCount),
+          SYNC_CONFIGS.MAX_BACKOFF
+        );
+        
+        await new Promise(resolve => setTimeout(resolve, backoff));
+        return this.startSyncProcess(userId, { retryCount: retryCount + 1 });
+      }
+      
+      throw error;
+    }
+  }
+
+  async syncContacts(userId, client) {
+    const lockKey = `contacts:${userId}`;
+    let lock = null;
+    let hasLock = false;
+
+    try {
+      // Try to acquire lock if redlock is available
+      if (this.redlock) {
+        try {
+      lock = await this.redlock.acquire([lockKey], 30000);
+          hasLock = true;
+          logger.info('[Matrix Service] Acquired lock for contact sync:', { userId });
+        } catch (lockError) {
+          logger.warn('[Matrix Service] Could not acquire lock for contact sync:', {
+            userId,
+            error: lockError.message
+          });
+          // Continue without lock
+        }
+      }
+
+      // Get all WhatsApp rooms
+      const rooms = await this.getWhatsAppRooms(client);
+      
+      // Process rooms in batches to avoid overwhelming the system
+      const batchSize = 10;
+      for (let i = 0; i < rooms.length; i += batchSize) {
+        const batch = rooms.slice(i, i + batchSize);
+        await Promise.all(batch.map(room => this.processContactRoom(userId, room)));
+        
+        // Update sync progress
+        const progress = Math.min(100, Math.round((i + batchSize) / rooms.length * 100));
+        this.updateSyncProgress(userId, 'contacts', progress);
+      }
+
+      return true;
+
+    } catch (error) {
+      logger.error('[Matrix Service] Contact sync failed:', {
+        userId,
+        error: error.message
+      });
+      throw error;
+    } finally {
+      // Release lock only if we acquired it
+      if (hasLock && lock) {
+        try {
+          await lock.release();
+          logger.info('[Matrix Service] Released lock for contact sync:', { userId });
+        } catch (releaseError) {
+          logger.error('[Matrix Service] Error releasing lock:', {
+            userId,
+            error: releaseError.message
+          });
+        }
+      }
     }
   }
 
@@ -556,442 +1042,6 @@ class MatrixWhatsAppService {
       userId,
       ...statusData
     });
-  }
-
-  connectWhatsApp = async (userId) => {
-    try {
-      console.log('=== Starting WhatsApp Connection Flow ===');
-      
-      // Update status to connecting
-      await this.updateConnectionStatus(userId, 'connecting');
-
-      console.log('Step 1: Validating Matrix client for user:', userId);
-      const matrixClient = this.matrixClients.get(userId);
-      if (!matrixClient) {
-        throw new Error('Matrix client not initialized. Please connect to Matrix first.');
-      }
-
-      // Ensure client is started and synced
-      console.log('Step 2: Ensuring Matrix client is synced...');
-      if (!matrixClient.clientRunning) {
-        console.log('Starting Matrix client...');
-        await matrixClient.startClient({
-          initialSyncLimit: 10
-        });
-      }
-
-      // Wait for initial sync with extended timeout
-      await new Promise((resolve, reject) => {
-        const syncTimeout = setTimeout(() => {
-          reject(new Error('Matrix sync timeout'));
-        }, 60000); // 60 seconds for initial sync
-
-        if (matrixClient.isInitialSyncComplete()) {
-          clearTimeout(syncTimeout);
-          resolve();
-        } else {
-          matrixClient.once('sync', (state) => {
-            clearTimeout(syncTimeout);
-            if (state === 'PREPARED') {
-              resolve();
-            } else {
-              reject(new Error(`Sync failed with state: ${state}`));
-            }
-          });
-        }
-      });
-
-      console.log('Matrix client synced successfully');
-
-      // Validate bridge bot availability
-      console.log('Step 3: Validating bridge bot...');
-      const bridgeBotValidation = await validateBridgeBot(matrixClient);
-      if (!bridgeBotValidation.valid) {
-        throw new Error(`Bridge bot validation failed: ${bridgeBotValidation.error}`);
-      }
-      console.log('Bridge bot validation successful:', bridgeBotValidation.status);
-
-      // Create bridge room with retries
-      console.log('Step 4: Creating bridge room...');
-      let bridgeRoom;
-      let attempts = 0;
-      const maxAttempts = 3;
-
-      while (attempts < maxAttempts) {
-        try {
-          bridgeRoom = await matrixClient.createRoom({
-            visibility: 'private',
-            name: `WhatsApp Bridge - ${userId}`,
-            topic: 'WhatsApp Bridge Connection Room',
-            invite: [BRIDGE_CONFIGS.whatsapp.bridgeBot],
-            preset: 'private_chat',
-            initial_state: [{
-              type: 'm.room.guest_access',
-              state_key: '',
-              content: { guest_access: 'forbidden' }
-            }]
-          });
-          break;
-        } catch (error) {
-          attempts++;
-          if (attempts === maxAttempts) throw error;
-          await new Promise(resolve => setTimeout(resolve, 2000));
-        }
-      }
-      console.log('Bridge room created:', bridgeRoom.room_id);
-
-      // Wait for room to be properly synced
-      console.log('Step 5: Waiting for room to be synced...');
-      await new Promise((resolve, reject) => {
-        const roomTimeout = setTimeout(() => {
-          reject(new Error('Room sync timeout'));
-        }, 10000);
-
-        const checkRoom = () => {
-          const roomObj = matrixClient.getRoom(bridgeRoom.room_id);
-          if (roomObj) {
-            clearTimeout(roomTimeout);
-            resolve();
-          } else {
-            setTimeout(checkRoom, 500);
-          }
-        };
-        checkRoom();
-      });
-
-      // Verify room state
-      const roomObj = matrixClient.getRoom(bridgeRoom.room_id);
-      console.log('Room state:', {
-        roomId: bridgeRoom.room_id,
-        name: roomObj.name,
-        joinedMembers: roomObj.getJoinedMembers().map(m => m.userId)
-      });
-
-      // Send login command
-      console.log('Step 6: Sending bridge initiation message...');
-      try {
-        await matrixClient.sendMessage(bridgeRoom.room_id, {
-          msgtype: 'm.text',
-          body: '!wa login qr'
-        });
-        console.log('Bridge initiation message sent');
-
-        // Emit room ID to client immediately after room creation
-        const io = getIO();
-        if (!io) {
-          console.error('Socket.IO instance not found');
-          throw new Error('Socket communication error');
-        }
-
-        // Emit to specific user's socket
-        const userSockets = Array.from(io.sockets.sockets.values())
-          .filter(socket => socket.userId === userId);
-
-        console.log('Found user sockets:', userSockets.length);
-
-        // Emit awaiting_scan immediately instead of pending
-        userSockets.forEach(socket => {
-          console.log('Emitting whatsapp_status to socket:', socket.id);
-          socket.emit('whatsapp_status', {
-            userId,
-            status: 'awaiting_scan',
-            bridgeRoomId: bridgeRoom.room_id
-          });
-        });
-
-        // Also emit through the event emitter as backup
-        ioEmitter.emit('whatsapp_status', {
-          userId,
-          status: 'awaiting_scan',
-          bridgeRoomId: bridgeRoom.room_id
-        });
-
-      } catch (error) {
-        console.error('Failed to send bridge initiation message:', error);
-        await matrixClient.leave(bridgeRoom.room_id);
-        throw new Error('Failed to initiate bridge. Please try again.');
-      }
-
-      // Set up message handling and QR code generation with extended timeout
-      return new Promise((resolve, reject) => {
-        let qrCodeReceived = false;
-        let connectionTimeout;
-        let qrTimeout;
-
-        const cleanup = () => {
-          clearTimeout(connectionTimeout);
-          clearTimeout(qrTimeout);
-          // matrixClient.removeListener('Room.timeline', handleResponse);
-          matrixClient.removeListener('Room.timeline', debugListener);
-        };
-
-        // Set overall connection timeout (5 minutes)
-        connectionTimeout = setTimeout(() => {
-          cleanup();
-          reject(new Error('WhatsApp connection timeout - Please try again'));
-        }, 300000); // 5 minutes
-
-        // Set QR code timeout
-        qrTimeout = setTimeout(() => {
-          if (!qrCodeReceived) {
-            cleanup();
-            reject(new Error('QR code not received within expected time'));
-          }
-        }, 60000); // 1 minute to receive QR code
-
-        console.log('Step 7: Setting up message handlers...');
-
-        // Debug listener for all timeline events
-        const debugListener = (event, room) => {
-          if (room.roomId !== bridgeRoom.room_id) return;
-          if (event.getSender() !== BRIDGE_CONFIGS.whatsapp.bridgeBot) return;
-
-          console.log('Got timeline event:', {
-            roomId: room.roomId,
-            sender: event.getSender(),
-            eventType: event.getType(),
-            msgtype: event.getContent().msgtype,
-            body: event.getContent().body
-          });
-
-          if (event.getType() === 'm.room.message') {
-            const body = event.getContent().body;
-            if (body && body.includes('Successfully logged in as')) {
-              const io = getIO();
-              if (io) {
-                const userSockets = Array.from(io.sockets.sockets.values())
-                  .filter(socket => socket.userId === userId);
-
-                const successData = {
-                  userId,
-                  status: 'connected',
-                  bridgeRoomId: bridgeRoom.room_id,
-                  qrReceived: true
-                };
-
-                // Emit to all user sockets
-                const emitPromises = userSockets.map(socket => {
-                  return new Promise((emitResolve) => {
-                    console.log('Emitting "connected" status to socket:', socket.id);
-                    socket.emit('whatsapp_status', successData, () => {
-                      // Acknowledgment callback
-                      emitResolve();
-                    });
-                  });
-                });
-
-                // Wait for all emissions to complete
-                Promise.all(emitPromises)
-                .then(() => {
-                  console.log('Successfully emitted to all sockets');
-                  // setTimeout(() => {
-                  //   console.log('Performing delayed cleanup...');
-                  //   cleanup();
-                  // }, 2000); 
-                  cleanup();
-                  resolve(successData);  // Resolve the promise with success data
-                })
-                .catch((error) => {
-                  console.error('Error in socket emission:', error);
-                  // Still resolve as the connection was successful
-                  cleanup();
-                  resolve(successData);
-                });
-                
-              } 
-            } 
-          }
-
-          
-        };
-        matrixClient.on('Room.timeline', debugListener);
-        matrixClient.on('Room.timeline', debugListener);
-
-        
-
-        // const handleResponse = async (event, room) => {
-        //   if (room.roomId !== bridgeRoom.room_id) {
-        //     console.log('Ignoring event from different room:', room.roomId);
-        //     return;
-        //   }
-        //   if (event.getSender() !== BRIDGE_CONFIGS.whatsapp.bridgeBot) {
-        //     console.log('Ignoring event from non-bridge sender:', event.getSender());
-        //     return;
-        //   }
-
-        //   const content = event.getContent();
-        //   console.log('Processing event from bridge bot:', {
-        //     type: event.getType(),
-        //     msgtype: content.msgtype,
-        //     hasBody: !!content.body,
-        //     url: content.url
-        //   });
-
-        //   // Handle QR code image
-        //   if (content.msgtype === 'm.image') {
-        //     qrCodeReceived = true;
-        //     clearTimeout(qrTimeout); // Clear QR timeout once received
-        //     console.log('Step 8: QR code image received in Element');
-            
-        //     // Emit awaiting_scan status to all user's sockets
-        //     const io = getIO();
-        //     if (io) {
-        //       const userSockets = Array.from(io.sockets.sockets.values())
-        //         .filter(socket => socket.userId === userId);
-              
-        //       userSockets.forEach(socket => {
-        //         console.log('Emitting awaiting_scan status to socket:', socket.id);
-        //         socket.emit('whatsapp_status', {
-        //           userId,
-        //           status: 'awaiting_scan',
-        //           bridgeRoomId: bridgeRoom.room_id,
-        //           qrReceived: true
-        //         });
-        //       });
-        //     }
-
-        //     // Also emit through event emitter for redundancy
-        //     ioEmitter.emit('whatsapp_status', {
-        //       userId,
-        //       status: 'awaiting_scan',
-        //       bridgeRoomId: bridgeRoom.room_id,
-        //       qrReceived: true
-        //     });
-
-        //     return;
-        //   }
-
-        //   // Handle text messages
-        //   if (event.getType() === 'm.room.message' && content.msgtype === 'm.text') {
-        //     const messageText = content.body;
-        //     console.log('Processing text message:', messageText);
-
-        //     // Handle successful connection with more specific matching
-        //     const loginMatch = messageText.match(/Successfully logged in as (\+\d+)/);
-        //     const alternateLoginMatch = messageText.match(/Logged in as (\+\d+)/);
-        //     const phoneNumberMatch = loginMatch || alternateLoginMatch;
-
-        //     if (phoneNumberMatch || 
-        //         messageText.includes('WhatsApp connection established') || 
-        //         messageText.includes('Connected to WhatsApp') ||
-        //         messageText.includes('Login successful')) {
-              
-        //       // Only proceed if we have explicit login confirmation with phone number
-        //       if (!phoneNumberMatch) {
-        //         console.log('Received connection confirmation, waiting for login message with phone number...');
-        //         return;
-        //       }
-
-        //       console.log('Step 9: WhatsApp connection successful with phone number');
-              
-        //       // Extract phone number from either match pattern
-        //       const phoneNumber = phoneNumberMatch[1];
-        //       console.log('Extracted phone number:', phoneNumber);
-
-        //       // Emit success through all available channels
-        //       console.log('Step 10: Emitting success status with login confirmation');
-        //       const successData = {
-        //         userId,
-        //         status: 'connected',
-        //         bridgeRoomId: bridgeRoom.room_id,
-        //         phoneNumber,
-        //         loginMessage: messageText
-        //       };
-
-        //       // Emit through socket.io
-        //       const io = getIO();
-        //       if (io) {
-        //         const userSockets = Array.from(io.sockets.sockets.values())
-        //           .filter(socket => socket.userId === userId);
-                
-        //         userSockets.forEach(socket => {
-        //           console.log('Emitting success to socket:', socket.id);
-        //           socket.emit('whatsapp_status', successData);
-        //         });
-        //       }
-
-        //       // Also emit through event emitter
-        //       ioEmitter.emit('whatsapp_status', successData);
-
-        //       // Update database
-        //       console.log('Step 11: Updating database with connection details');
-        //       try {
-        //         const { error } = await adminClient
-        //           .from('accounts')
-        //           .upsert({
-        //             user_id: userId,
-        //             platform: 'whatsapp',
-        //             status: 'active',
-        //             credentials: {
-        //               bridge_room_id: bridgeRoom.room_id,
-        //               phone_number: phoneNumber
-        //             },
-        //             connected_at: new Date().toISOString()
-        //           });
-
-        //         if (error) {
-        //           console.error('Database update failed:', error);
-        //           // Even if DB update fails, connection is successful
-        //           console.log('Connection successful despite DB error');
-        //         }
-
-        //         // Store connection info
-        //         this.connections.set(userId, {
-        //           bridgeRoomId: bridgeRoom.room_id,
-        //           matrixClient,
-        //           phoneNumber
-        //         });
-
-        //         cleanup();
-        //         resolve(successData);
-        //       } catch (dbError) {
-        //         console.error('Database operation failed:', dbError);
-        //         // Still consider connection successful
-        //         cleanup();
-        //         resolve(successData);
-        //       }
-        //     }
-
-        //     // Handle connection errors with more specific messages
-        //     if (messageText.toLowerCase().includes('error') || 
-        //         messageText.toLowerCase().includes('failed') ||
-        //         messageText.toLowerCase().includes('timeout')) {
-        //       console.error('WhatsApp connection error:', messageText);
-        //       cleanup();
-              
-        //       let errorMessage = 'Connection failed';
-        //       if (messageText.toLowerCase().includes('timeout')) {
-        //         errorMessage = 'Connection timed out. Please try again.';
-        //       } else if (messageText.toLowerCase().includes('invalid')) {
-        //         errorMessage = 'Invalid QR code or connection request. Please try again.';
-        //       }
-              
-        //       reject(new Error(errorMessage));
-        //     }
-        //   }
-        // };
-
-        // matrixClient.on('Room.timeline', handleResponse);
-      });
-
-      // Update status to connected
-      await this.updateConnectionStatus(userId, 'connected', bridgeRoom.room_id);
-
-      // Store connection in memory
-      this.connections.set(userId, {
-        matrixClient,
-        bridgeRoomId: bridgeRoom.room_id,
-        status: 'connected'
-      });
-
-    } catch (error) {
-      // Clean up any partial connection state
-      this.connections.delete(userId);
-      
-      await this.updateConnectionStatus(userId, 'error');
-      console.error('=== WhatsApp Connection Flow Failed ===', error);
-      throw error;
-    }
   }
 
   disconnectWhatsApp = async (userId) => {
@@ -1331,7 +1381,7 @@ class MatrixWhatsAppService {
       }
 
       // Initialize sync state
-      await this.updateSyncProgress(syncKey, {
+      await this.updateSyncProgress(userId, {
         state: SYNC_STATES.PREPARING,
         progress: 0,
         startedAt: Date.now(),
@@ -1488,18 +1538,20 @@ class MatrixWhatsAppService {
   getMatrixClient = async (userId) => {
     try {
       // Check active connections first
-      let client = this.connectionPool.active.get(userId);
-      if (client) {
-        return client;
+      let connection = this.connectionPool.active.get(userId);
+      if (connection?.client) {
+        connection.lastUsed = Date.now();
+        return connection.client;
       }
 
       // Check idle connections
-      client = this.connectionPool.idle.get(userId);
-      if (client) {
+      connection = this.connectionPool.idle.get(userId);
+      if (connection?.client) {
         // Move to active pool
         this.connectionPool.idle.delete(userId);
-        this.connectionPool.active.set(userId, client);
-        return client;
+        connection.lastUsed = Date.now();
+        this.connectionPool.active.set(userId, connection);
+        return connection.client;
       }
 
       // Check connection pool limits
@@ -1978,6 +2030,7 @@ class MatrixWhatsAppService {
       const cachedContacts = await pubClient.get(CACHE_KEY);
       if (cachedContacts) {
         const parsed = JSON.parse(cachedContacts);
+        logger.info('-----cached contacts returned ----')
         // Return cached data if it's less than 5 minutes old
         if (Date.now() - parsed.timestamp < CACHE_DURATION * 1000) {
           return parsed.contacts;
@@ -2644,30 +2697,63 @@ class MatrixWhatsAppService {
     }
   }
 
-  waitForSync = async (userId, client, timeout = BRIDGE_TIMEOUTS.SYNC) => {
+  waitForSync = async (userId, client, options = {}) => {
+    const isInitial = options.isInitial ?? true;
+    const timeout = isInitial ? SYNC_CONFIGS.INITIAL_TIMEOUT : SYNC_CONFIGS.INCREMENTAL_TIMEOUT;
+    
     return new Promise((resolve, reject) => {
-      const timeoutId = setTimeout(() => {
-        reject(new Error('Sync timeout'));
-      }, timeout);
-
-      const onSync = (state) => {
-        if (state === 'PREPARED' || state === 'SYNCING') {
-          cleanup();
-          resolve();
-        } else if (state === 'ERROR') {
-          cleanup();
-          reject(new Error('Sync error'));
-        }
-      };
+      let timeoutId;
+      let checkInterval;
 
       const cleanup = () => {
-        clearTimeout(timeoutId);
+        if (timeoutId) clearTimeout(timeoutId);
+        if (checkInterval) clearInterval(checkInterval);
         client.removeListener('sync', onSync);
       };
 
+      const onSync = async (state, prevState, data) => {
+        if (state === 'PREPARED' || state === 'SYNCING') {
+          cleanup();
+          
+          // Store sync token for incremental syncs
+          const syncToken = client.getSyncToken();
+          if (syncToken) {
+            await this.storeSyncToken(userId, syncToken);
+          }
+          
+          resolve();
+        } else if (state === 'ERROR') {
+          cleanup();
+          reject(new Error('Sync error: ' + (data?.error?.message || 'Unknown error')));
+        }
+      };
+
+      // Set timeout with exponential backoff
+      const retryCount = options.retryCount || 0;
+      const backoff = Math.min(
+        SYNC_CONFIGS.BASE_BACKOFF * Math.pow(2, retryCount),
+        SYNC_CONFIGS.MAX_BACKOFF
+      );
+
+      timeoutId = setTimeout(() => {
+        cleanup();
+        reject(new Error(`Sync timeout after ${timeout}ms`));
+      }, timeout + backoff);
+
+      // Check sync progress periodically
+      checkInterval = setInterval(() => {
+        const progress = client.getSyncProgress();
+        if (progress) {
+          this.updateSyncProgress(userId, {
+            state: 'syncing',
+            progress: Math.round(progress * 100)
+          });
+        }
+      }, 1000);
+
       client.on('sync', onSync);
     });
-  }
+  };
 
   handleSyncStateChange = (userId, state, prevState, data) => {
     try {
@@ -2840,6 +2926,335 @@ class MatrixWhatsAppService {
         userId,
         error
       });
+      throw error;
+    }
+  }
+
+  async handleError(userId, error, context = {}) {
+    const errorType = this.classifyError(error);
+    const errorCount = this.incrementErrorCount(userId, errorType);
+    const threshold = this.errorTracking.thresholds[errorType] || 5;
+
+    // Log error with context
+    logger.error('[Matrix Service] Error occurred:', {
+      userId,
+      type: errorType,
+      count: errorCount,
+      context,
+      error: error.message,
+      stack: error.stack
+    });
+
+    // Check if we should retry based on error type and count
+    const shouldRetry = await this.determineRetryStrategy(userId, errorType, errorCount, threshold);
+
+    if (shouldRetry) {
+      await this.executeRetryStrategy(userId, errorType, context);
+    } else {
+      await this.handleFailedRetries(userId, errorType, context);
+    }
+
+    return {
+      shouldRetry,
+      errorType,
+      errorCount,
+      threshold
+    };
+  }
+
+  classifyError(error) {
+    const message = error.message?.toLowerCase() || '';
+    const code = error.code?.toLowerCase() || '';
+
+    if (message.includes('rate') || code.includes('m_limit_exceeded')) {
+      return 'RATE_LIMIT';
+    }
+    if (message.includes('auth') || message.includes('token') || code.includes('m_unknown_token')) {
+      return 'AUTH';
+    }
+    if (message.includes('network') || message.includes('timeout') || code.includes('m_unknown')) {
+      return 'NETWORK';
+    }
+    if (message.includes('sync') || code.includes('m_bad_sync')) {
+      return 'SYNC';
+    }
+    return 'UNKNOWN';
+  }
+
+  incrementErrorCount(userId, errorType) {
+    const key = `${userId}:${errorType}`;
+    const currentCount = this.errorTracking.counts.get(key) || 0;
+    this.errorTracking.counts.set(key, currentCount + 1);
+    return currentCount + 1;
+  }
+
+  async determineRetryStrategy(userId, errorType, errorCount, threshold) {
+    // Don't retry if we've exceeded the threshold
+    if (errorCount >= threshold) {
+      return false;
+    }
+
+    switch (errorType) {
+      case 'RATE_LIMIT':
+        // Implement exponential backoff for rate limits
+        await this.syncLimiter.removeTokens(1);
+        return true;
+
+      case 'AUTH':
+        // Try to refresh token before giving up
+        const refreshed = await this.refreshUserToken(userId);
+        return refreshed;
+
+      case 'NETWORK':
+        // Retry with increasing delays for network issues
+        await this.delay(Math.min(1000 * Math.pow(2, errorCount), 30000));
+        return true;
+
+      case 'SYNC':
+        // Clear sync state and retry
+        this.syncStates.delete(userId);
+        return errorCount < 3;
+
+      default:
+        return errorCount < 2;
+    }
+  }
+
+  async executeRetryStrategy(userId, errorType, context) {
+    switch (errorType) {
+      case 'RATE_LIMIT':
+        await this.handleRateLimitRetry(userId);
+        break;
+      case 'AUTH':
+        await this.handleAuthRetry(userId);
+        break;
+      case 'NETWORK':
+        await this.handleNetworkRetry(userId);
+        break;
+      case 'SYNC':
+        await this.handleSyncRetry(userId);
+        break;
+      default:
+        await this.handleDefaultRetry(userId);
+    }
+
+    // Log retry attempt
+    logger.info('[Matrix Service] Executing retry strategy:', {
+      userId,
+      errorType,
+      context
+    });
+  }
+
+  async handleFailedRetries(userId, errorType, context) {
+    // Log failure
+    logger.error('[Matrix Service] Retry attempts exhausted:', {
+      userId,
+      errorType,
+      context
+    });
+
+    // Cleanup resources
+    await this.closeConnection(userId, this.connections.get(userId));
+    
+    // Notify monitoring system
+    await this.notifyMonitoring({
+      type: 'RETRY_EXHAUSTED',
+      userId,
+      errorType,
+      context
+    });
+
+    // Clear error counts after handling
+    this.resetErrorCountsForUser(userId);
+  }
+
+  async refreshUserToken(userId) {
+    try {
+      const newTokens = await tokenService.refreshToken(userId);
+      if (newTokens?.access_token) {
+        // Update client with new token
+        const client = this.matrixClients.get(userId);
+        if (client) {
+          client.setAccessToken(newTokens.access_token);
+        }
+        return true;
+      }
+    } catch (error) {
+      logger.error('[Matrix Service] Token refresh failed:', {
+        userId,
+        error: error.message
+      });
+    }
+    return false;
+  }
+
+  resetErrorCountsForUser(userId) {
+    for (const [key, _] of this.errorTracking.counts) {
+      if (key.startsWith(`${userId}:`)) {
+        this.errorTracking.counts.delete(key);
+      }
+    }
+  }
+
+  resetErrorCounts() {
+    this.errorTracking.counts.clear();
+  }
+
+  delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  async notifyMonitoring(data) {
+    try {
+      // Implement monitoring notification
+      // This could be sending metrics to a monitoring service
+      // or triggering alerts based on error patterns
+      await monitoringService.notify(data);
+    } catch (error) {
+      logger.error('[Matrix Service] Failed to notify monitoring:', {
+        error: error.message,
+        data
+      });
+    }
+  }
+
+  // Helper methods for sync token management
+  storeSyncToken = async (userId, token) => {
+    const key = `sync_token:${userId}`;
+    await pubClient.set(key, token, 'EX', 86400); // Store for 24 hours
+  };
+
+  getSavedSyncToken = async (userId) => {
+    const key = `sync_token:${userId}`;
+    return await pubClient.get(key);
+  };
+
+  async fetchContactsFromMatrix(userId) {
+    try {
+      // Get Matrix client for the user
+      const matrixClient = await this.getMatrixClientWithRetry(userId);
+      if (!matrixClient) {
+        throw new Error('Matrix client not available');
+      }
+
+      // Get all WhatsApp rooms
+      const rooms = await this.getWhatsAppRooms(matrixClient);
+      
+      // Process each room to extract contact information
+      const contacts = await Promise.all(rooms.map(async room => {
+        try {
+          // Skip if not a WhatsApp room
+          if (!room.name?.includes('(WA)') && !room.name?.includes('WhatsApp')) {
+            return null;
+          }
+
+          // Get room members
+          const members = room.getJoinedMembers();
+          const bridgeBot = members.find(m => m.userId === BRIDGE_CONFIGS.whatsapp.bridgeBot);
+          
+          // Skip if bridge bot is not in the room
+          if (!bridgeBot) {
+            return null;
+          }
+
+          // Get WhatsApp ID from room state or name
+          let whatsappId = null;
+          const stateEvents = room.currentState.getStateEvents('m.room.whatsapp');
+          if (stateEvents && stateEvents[0]) {
+            whatsappId = stateEvents[0].getContent().whatsapp_id;
+          }
+
+          if (!whatsappId) {
+            const phoneMatch = room.name.match(/([0-9]+)/);
+            whatsappId = phoneMatch ? phoneMatch[0] : null;
+          }
+
+          if (!whatsappId) {
+            return null;
+          }
+
+          // Get last message if available
+          let lastMessage = null;
+          let lastMessageTime = null;
+          const timeline = room.timeline;
+          if (timeline && timeline.length > 0) {
+            const lastEvent = timeline[timeline.length - 1];
+            if (lastEvent.getType() === 'm.room.message') {
+              lastMessage = lastEvent.getContent().body;
+              lastMessageTime = new Date(lastEvent.getTs()).toISOString();
+            }
+          }
+
+          // Get unread count
+          const readUpToEventId = room.getEventReadUpTo(matrixClient.getUserId());
+          const unreadCount = timeline ? 
+            timeline.filter(event => 
+              event.getType() === 'm.room.message' && 
+              event.getId() > readUpToEventId
+            ).length : 0;
+
+          // Build contact object
+          return {
+            user_id: userId,
+            whatsapp_id: whatsappId,
+            display_name: room.name.replace(' (WA)', '').trim(),
+            sync_status: 'active',
+            metadata: {
+              room_id: room.roomId,
+              room_name: room.name,
+              last_message: lastMessage,
+              last_message_at: lastMessageTime,
+              unread_count: unreadCount
+            }
+          };
+        } catch (error) {
+          console.error('Error processing room:', room.roomId, error);
+          return null;
+        }
+      }));
+
+      // Filter out null values and return valid contacts
+      return contacts.filter(Boolean);
+
+    } catch (error) {
+      console.error('Failed to fetch contacts from Matrix:', error);
+      throw error;
+    }
+  }
+
+  async getWhatsAppRooms(matrixClient) {
+    try {
+      if (!matrixClient) {
+        throw new Error('Matrix client not provided');
+      }
+
+      // Get all rooms the user is in
+      const rooms = matrixClient.getRooms();
+      
+      // Filter for WhatsApp rooms
+      const whatsappRooms = rooms.filter(room => {
+        // Check if room has bridge bot
+        const members = room.getJoinedMembers();
+        const hasBridgeBot = members.some(member => 
+          member.userId === BRIDGE_CONFIGS.whatsapp.bridgeBot
+        );
+
+        // Check if room name indicates WhatsApp
+        const isWhatsAppRoom = room.name && (
+          room.name.includes('(WA)') || 
+          room.name.includes('WhatsApp')
+        );
+
+        // Check for WhatsApp state events
+        const hasWhatsAppState = room.currentState.getStateEvents('m.room.whatsapp').length > 0;
+
+        return hasBridgeBot && (isWhatsAppRoom || hasWhatsAppState);
+      });
+
+      return whatsappRooms;
+    } catch (error) {
+      console.error('Error getting WhatsApp rooms:', error);
       throw error;
     }
   }

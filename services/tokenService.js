@@ -6,12 +6,75 @@ import { redisClient } from '../utils/redis.js';
 
 class TokenService {
   constructor() {
+    this.initialized = false;
+    this.subscribers = new Set();
+    this.activeSession = null;
+    this.refreshTimer = null;
     this.tokenRefreshPromise = null;
     this.lastRefresh = null;
     this.MIN_TOKEN_LIFETIME = 30000; // 30 seconds
-    this.subscribers = new Set();
     this.cleanupInterval = setInterval(() => this.cleanup(), 60000); // Cleanup every minute
     this.sessionCache = new Map();
+  }
+
+  async initialize() {
+    try {
+      logger.info('[Token] Initializing token service...');
+
+      // Try to get stored session
+      const session = await this.getStoredSession();
+      
+      if (!session) {
+        logger.warn('[Token] No active session found - initializing in stateless mode');
+        this.initialized = true;
+        return true;
+      }
+
+      // Initialize with existing session
+      this.activeSession = session;
+      
+      // Setup refresh timer if we have a session
+      if (session.expires_at) {
+        this.setupRefreshTimer(session.expires_at);
+      }
+
+      this.initialized = true;
+      logger.info('[Token] Token service initialized successfully');
+      
+      return true;
+    } catch (error) {
+      logger.warn('[Token] Initializing without active session:', error);
+      this.initialized = true;
+      return true;
+    }
+  }
+
+  async getStoredSession() {
+    try {
+      const { data: session } = await adminClient.auth.getSession();
+      return session;
+    } catch (error) {
+      logger.debug('[Token] No stored session found:', error);
+      return null;
+    }
+  }
+
+  setupRefreshTimer(expiresAt) {
+    if (this.refreshTimer) {
+      clearTimeout(this.refreshTimer);
+    }
+
+    const now = Date.now();
+    const expiryTime = new Date(expiresAt).getTime();
+    const timeToExpiry = expiryTime - now;
+    
+    // Refresh 5 minutes before expiry
+    const refreshTime = Math.max(timeToExpiry - 300000, 0);
+    
+    if (refreshTime > 0) {
+      this.refreshTimer = setTimeout(() => this.refreshToken(), refreshTime);
+      logger.debug('[Token] Refresh timer set for:', new Date(now + refreshTime));
+    }
   }
 
   async getValidToken() {

@@ -72,9 +72,9 @@ async function checkBridgeHealth() {
     // Get all active accounts with bridge rooms
     const { data: accounts, error } = await adminClient
       .from('accounts')
-      .select('user_id, platform, bridge_room_id, credentials')
+      .select('user_id, platform, credentials')
       .eq('status', 'active')
-      .not('bridge_room_id', 'is', null);
+      .not('credentials->bridge_room_id', 'is', null);
 
     if (error) throw error;
 
@@ -87,12 +87,13 @@ async function checkBridgeHealth() {
       try {
         if (account.platform === 'matrix') {
           const client = await matrixService.getClient(account.user_id);
-          const room = client?.getRoom(account.bridge_room_id);
+          const bridgeRoomId = account.credentials?.bridge_room_id;
+          const room = client?.getRoom(bridgeRoomId);
           
           bridges[bridgeKey] = {
             status: room ? 'connected' : 'disconnected',
             lastCheck: new Date().toISOString(),
-            bridgeRoomId: account.bridge_room_id,
+            bridgeRoomId,
             error: null
           };
         }
