@@ -18,6 +18,8 @@ import { sleep } from '../utils/backoff.js';
 import RateLimit from 'async-ratelimiter';
 import { promisify } from 'util';
 import Redlock from 'redlock';
+import { DistributedLock } from '../utils/lockManager.js';
+import { redisService } from '../utils/redis.js';
 
 const SYNC_BATCH_SIZE = parseInt(process.env.MATRIX_SYNC_BATCH_SIZE || '50', 10);
 const MAX_SYNC_BATCHES = parseInt(process.env.MATRIX_MAX_SYNC_BATCHES || '5', 10);
@@ -171,14 +173,14 @@ class MatrixWhatsAppService {
     this.errorTracking = {
       counts: new Map(),
       thresholds: {
-        RATE_LIMIT: 5,
-        AUTH: 3,
-        NETWORK: 10,
-        SYNC: 5
+      RATE_LIMIT: 5,
+      AUTH: 3,
+      NETWORK: 10,
+      SYNC: 5
       },
       resetInterval: 3600000 // 1 hour
     };
-
+    
     // Initialize rate limiters
     this.syncLimiter = syncLimiter;
     this.tokenLimiter = tokenLimiter;
@@ -204,6 +206,7 @@ class MatrixWhatsAppService {
 
     // Start maintenance tasks
     this.startMaintenanceTasks();
+    this.lockManager = new DistributedLock(pubClient);
   }
 
   async startMaintenanceTasks() {
@@ -381,13 +384,7 @@ class MatrixWhatsAppService {
   }
 
   async getConnection(userId) {
-    const lockKey = `connection:${userId}`;
-    let lock = null;
-
-    try {
-      // Acquire distributed lock
-      lock = await this.redlock.acquire([lockKey], 30000);
-
+    return this.lockManager.withLock(`matrix:connection:${userId}`, async () => {
       // Check active connections
       let conn = this.connectionPool.active.get(userId);
       if (conn?.client?.isRunning()) {
@@ -416,10 +413,7 @@ class MatrixWhatsAppService {
       }
 
       throw new Error('Connection pool exhausted');
-
-    } finally {
-      if (lock) await lock.release();
-    }
+    });
   }
 
   async createConnection(userId) {
@@ -778,26 +772,7 @@ class MatrixWhatsAppService {
   }
 
   async syncContacts(userId, client) {
-    const lockKey = `contacts:${userId}`;
-    let lock = null;
-    let hasLock = false;
-
-    try {
-      // Try to acquire lock if redlock is available
-      if (this.redlock) {
-        try {
-      lock = await this.redlock.acquire([lockKey], 30000);
-          hasLock = true;
-          logger.info('[Matrix Service] Acquired lock for contact sync:', { userId });
-        } catch (lockError) {
-          logger.warn('[Matrix Service] Could not acquire lock for contact sync:', {
-            userId,
-            error: lockError.message
-          });
-          // Continue without lock
-        }
-      }
-
+    return this.lockManager.withLock(`matrix:contacts:${userId}`, async () => {
       // Get all WhatsApp rooms
       const rooms = await this.getWhatsAppRooms(client);
       
@@ -811,29 +786,7 @@ class MatrixWhatsAppService {
         const progress = Math.min(100, Math.round((i + batchSize) / rooms.length * 100));
         this.updateSyncProgress(userId, 'contacts', progress);
       }
-
-      return true;
-
-    } catch (error) {
-      logger.error('[Matrix Service] Contact sync failed:', {
-        userId,
-        error: error.message
-      });
-      throw error;
-    } finally {
-      // Release lock only if we acquired it
-      if (hasLock && lock) {
-        try {
-          await lock.release();
-          logger.info('[Matrix Service] Released lock for contact sync:', { userId });
-        } catch (releaseError) {
-          logger.error('[Matrix Service] Error releasing lock:', {
-            userId,
-            error: releaseError.message
-          });
-        }
-      }
-    }
+    });
   }
 
   updateConnectionStatus = async (userId, status, bridgeRoomId = null, options = {}) => {
@@ -1225,142 +1178,109 @@ class MatrixWhatsAppService {
         }
       });
 
+      // Set up socket connection with heartbeat
+      const io = getIO();
+      if (io) {
+        const socket = io.sockets.sockets.get(`user:${userId}`);
+        if (socket) {
+          // Setup heartbeat
+          const heartbeat = setInterval(() => {
+            if (socket.connected) {
+              socket.emit('whatsapp:heartbeat');
+            } else {
+              clearInterval(heartbeat);
+            }
+          }, 30000); // 30 second heartbeat
+
+          // Handle reconnection
+          socket.on('disconnect', () => {
+            clearInterval(heartbeat);
+            // Store pending updates
+            this.storePendingUpdates(userId);
+          });
+
+          socket.on('reconnect', () => {
+            // Restore pending updates
+            this.restorePendingUpdates(userId);
+          });
+        }
+      }
+
       // Set up timeline listener for all rooms
       matrixClient.on('Room.timeline', async (event, room, toStartOfTimeline) => {
         try {
-          // Skip if not a message event
-          if (event.getType() !== 'm.room.message') return;
-          
-          // Skip if from bridge bot or self
-          if (event.getSender() === BRIDGE_CONFIGS.whatsapp.bridgeBot ||
-              event.getSender() === matrixClient.getUserId()) return;
-
-          // Get contact info from room
+          // Skip if not a WhatsApp room
           const contactInfo = this.roomToContactMap.get(room.roomId);
-          if (!contactInfo) {
-            console.log('[Matrix Service] No contact mapping found for room:', room.roomId);
-            return;
-          }
+          if (!contactInfo) return;
 
-          const content = event.getContent();
-          if (!content || !content.body) return;
-
-          // Prepare message data
-          const messageData = {
-            user_id: userId,
-            contact_id: contactInfo.contactId,
-            message_id: event.getId(),
-            content: content.body,
-            sender_id: event.getSender(),
-            sender_name: room.getMember(event.getSender())?.name || event.getSender(),
-            message_type: content.msgtype === 'm.text' ? 'text' : 'media',
-            metadata: {
-              room_id: room.roomId,
-              event_id: event.getId(),
-              raw_event: event.event
-            },
-            timestamp: new Date(event.getTs()).toISOString(),
-            is_read: false
-          };
-
-          // Store message in database with retry
+          // Process message with retries
           let retryCount = 0;
           while (retryCount < 3) {
             try {
-              const { error: insertError } = await adminClient
-                .from('whatsapp_messages')
-                .upsert(messageData, {
-                  onConflict: 'user_id,message_id',
-                  returning: true
-                });
-
-              if (!insertError) {
-                // Update sync status and emit event
-                await this.updateSyncStatus(userId, contactInfo.contactId, 'approved');
-                global.io?.to(`user:${userId}`).emit('whatsapp:message', messageData);
-                break;
-              }
-
-              retryCount++;
-              if (retryCount < 3) {
-                await new Promise(resolve => setTimeout(resolve, 1000 * retryCount));
-              }
+              await this.processMessage(userId, contactInfo.contactId, event);
+              break;
             } catch (err) {
-              console.error('[Matrix Service] Error storing message (attempt ${retryCount + 1}):', err);
               retryCount++;
               if (retryCount === 3) throw err;
               await new Promise(resolve => setTimeout(resolve, 1000 * retryCount));
             }
           }
         } catch (error) {
-          console.error('[Matrix Service] Error processing timeline event:', error);
-        }
-      });
-
-      // Set up reconnection handler
-      matrixClient.on('sync', async (state, prevState, data) => {
-        console.log('[Matrix Service] Sync state changed:', {
-          state,
-          prevState,
-          timestamp: new Date().toISOString(),
-          error: state === 'ERROR' ? data?.error : undefined
-        });
-        
-        if (state === 'ERROR') {
-          console.error('[Matrix Service] Sync error:', {
-            error: data.error,
-            syncState: state,
-            prevState,
-            timestamp: new Date().toISOString()
+          logger.error('[Matrix Service] Error processing timeline event:', {
+            userId,
+            roomId: room.roomId,
+            error: error.message
           });
-
-          // Clear any existing handlers to prevent duplicate events
-          matrixClient.removeAllListeners('Room.timeline');
-          
-          // Implement exponential backoff for retries
-          const retryDelay = Math.min(1000 * Math.pow(2, this.syncRetryCount || 0), 32000);
-          this.syncRetryCount = (this.syncRetryCount || 0) + 1;
-          
-          console.log(`[Matrix Service] Attempting reconnect in ${retryDelay}ms (attempt ${this.syncRetryCount})`);
-          
-          setTimeout(async () => {
-            try {
-              // First try to verify the connection
-              const whoamiResponse = await matrixClient.whoami();
-              if (!whoamiResponse?.user_id) {
-                throw new Error('Invalid whoami response');
-              }
-
-              console.log('[Matrix Service] Connection verified, attempting to resume sync...');
-              await matrixClient.startClient({
-                initialSyncLimit: 10,
-                includeArchivedRooms: false
-              });
-            } catch (err) {
-              console.error('[Matrix Service] Reconnection failed:', err);
-              
-              // If we've tried too many times, force a full restart
-              if (this.syncRetryCount >= 5) {
-                console.log('[Matrix Service] Too many retry attempts, forcing full restart');
-                this.syncRetryCount = 0;
-                await this.restartMatrixClient(userId);
-              }
-            }
-          }, retryDelay);
-        } else if (state === 'PREPARED') {
-          console.log('[Matrix Service] Sync prepared successfully');
-          this.syncRetryCount = 0;
-          
-          // Re-setup timeline listeners if needed
-          this.setupTimelineListeners(userId, matrixClient);
         }
       });
 
-      console.log('Message sync setup completed for user:', userId);
-      return true;
+      logger.info('[Matrix Service] Message sync setup completed for user:', userId);
     } catch (error) {
-      console.error('Error setting up message sync:', error);
+      logger.error('[Matrix Service] Error in setupMessageSync:', {
+        userId,
+        error: error.message
+      });
       throw error;
+    }
+  }
+
+  async storePendingUpdates(userId) {
+    try {
+      const pendingUpdates = this.pendingUpdates.get(userId) || [];
+      if (pendingUpdates.length > 0) {
+        await pubClient.set(
+          `pending:${userId}`,
+          JSON.stringify(pendingUpdates),
+          'EX',
+          86400 // Store for 24 hours
+        );
+      }
+    } catch (error) {
+      logger.error('[Matrix Service] Error storing pending updates:', {
+        userId,
+        error: error.message
+      });
+    }
+  }
+
+  async restorePendingUpdates(userId) {
+    try {
+      const pendingData = await pubClient.get(`pending:${userId}`);
+      if (pendingData) {
+        const updates = JSON.parse(pendingData);
+        const io = getIO();
+        if (io) {
+          updates.forEach(update => {
+            io.to(`user:${userId}`).emit(update.event, update.data);
+          });
+        }
+        await pubClient.del(`pending:${userId}`);
+      }
+    } catch (error) {
+      logger.error('[Matrix Service] Error restoring pending updates:', {
+        userId,
+        error: error.message
+      });
     }
   }
 
@@ -1559,13 +1479,6 @@ class MatrixWhatsAppService {
         throw new Error('Connection pool limit reached');
       }
 
-      // Apply rate limiting for new connections
-      const rateLimitResult = await this.syncLimiter.get({ id: userId });
-      if (!rateLimitResult.remaining) {
-        const retryAfter = Math.ceil((rateLimitResult.reset - Date.now()) / 1000);
-        throw new Error(`Rate limit exceeded. Retry after ${retryAfter} seconds`);
-      }
-
       // Get valid token with rate limiting
       const tokenLimitResult = await this.tokenLimiter.get({ id: userId });
       if (!tokenLimitResult.remaining) {
@@ -1574,15 +1487,27 @@ class MatrixWhatsAppService {
       }
 
       const tokenData = await tokenService.getValidToken();
-      if (!tokenData) {
-        throw new Error('No valid token available');
+      if (!tokenData?.access_token) {
+        throw new Error('No valid access token available');
       }
 
-      // Initialize new client
-      client = sdk.createClient({
-        baseUrl: process.env.MATRIX_SERVER_URL,
+      // Validate required credentials
+      const homeserver = process.env.MATRIX_SERVER_URL;
+      const matrixUserId = `@${userId}:${process.env.MATRIX_SERVER_DOMAIN}`;
+
+      if (!homeserver || !matrixUserId) {
+        logger.error('[Matrix Service] Invalid Matrix configuration:', {
+          hasHomeserver: !!homeserver,
+          hasMatrixUserId: !!matrixUserId
+        });
+        throw new Error('Invalid Matrix configuration');
+      }
+
+      // Initialize new client with validated credentials
+      const client = sdk.createClient({
+        baseUrl: homeserver,
         accessToken: tokenData.access_token,
-        userId: `@${userId}:${process.env.MATRIX_SERVER_DOMAIN}`,
+        userId: matrixUserId,
         timeoutMs: 10000,
         localTimeoutMs: 10000
       });
@@ -1600,8 +1525,6 @@ class MatrixWhatsAppService {
           }
 
           client.setAccessToken(newTokenData.access_token);
-          await this.validateMatrixClient(userId);
-          
           logger.info('[Matrix Service] Updated access token:', {
             userId,
             tokenExpiry: newTokenData.expires_at
@@ -1621,33 +1544,47 @@ class MatrixWhatsAppService {
         lastUsed: Date.now()
       });
 
-      // Set up client event handlers with enhanced monitoring
-      client.once('sync', (state) => {
-        if (state === 'ERROR') {
-          this.handleError(userId, new Error('Sync failed'), {
-            context: 'sync',
-            state
-          });
-        } else {
-          this.updateConnectionState(userId, CONNECTION_STATES.CONNECTED);
-        }
-      });
+      // Start client and wait for sync
+      try {
+        await client.startClient({
+          initialSyncLimit: 10,
+          lazyLoadMembers: true
+        });
 
-      await client.startClient();
-      
-      return client;
-    } catch (error) {
-      logger.error('[Matrix Service] Failed to get Matrix client:', error);
-      
-      const recovery = await this.handleError(userId, error, {
-        context: 'client_initialization'
-      });
-      
-      if (recovery.shouldRetry) {
-        await sleep(recovery.backoffMs);
-        return this.getMatrixClientWithRetry(userId);
+        await this.waitForSync(userId, client, {
+          isInitial: true,
+          retryCount: 0
+        });
+
+        this.updateConnectionState(userId, CONNECTION_STATES.CONNECTED);
+        return client;
+
+      } catch (error) {
+        // Clean up on failure
+        this.connectionPool.active.delete(userId);
+        unsubscribe();
+        
+        logger.error('[Matrix Service] Failed to initialize Matrix client:', {
+          userId,
+          error: error.message
+        });
+        
+        const recovery = await this.handleError(userId, error, {
+          context: 'client_initialization'
+        });
+        
+        if (recovery.shouldRetry) {
+          await this.delay(recovery.backoffMs);
+          return this.getMatrixClientWithRetry(userId);
+        }
+        
+        throw error;
       }
-      
+    } catch (error) {
+      logger.error('[Matrix Service] Error in getMatrixClient:', {
+        userId,
+        error: error.message
+      });
       throw error;
     }
   }
@@ -2697,63 +2634,64 @@ class MatrixWhatsAppService {
     }
   }
 
-  waitForSync = async (userId, client, options = {}) => {
-    const isInitial = options.isInitial ?? true;
-    const timeout = isInitial ? SYNC_CONFIGS.INITIAL_TIMEOUT : SYNC_CONFIGS.INCREMENTAL_TIMEOUT;
-    
+  async waitForSync(matrixClient) {
+    if (!matrixClient) {
+      throw new Error('Matrix client is required for sync');
+    }
+
     return new Promise((resolve, reject) => {
-      let timeoutId;
-      let checkInterval;
+      logger.debug('[Matrix Service] Starting waitForSync', {
+        clientId: matrixClient.getUserId()
+      });
+      
+      const timeout = setTimeout(() => {
+        cleanup();
+        reject(new Error('Matrix sync timeout after 30s'));
+      }, this.SYNC_TIMEOUT);
 
       const cleanup = () => {
-        if (timeoutId) clearTimeout(timeoutId);
-        if (checkInterval) clearInterval(checkInterval);
-        client.removeListener('sync', onSync);
+        logger.debug('[Matrix Service] Cleaning up sync listeners');
+        matrixClient.removeListener('sync', onSync);
+        clearTimeout(timeout);
       };
 
-      const onSync = async (state, prevState, data) => {
-        if (state === 'PREPARED' || state === 'SYNCING') {
-          cleanup();
-          
-          // Store sync token for incremental syncs
-          const syncToken = client.getSyncToken();
-          if (syncToken) {
-            await this.storeSyncToken(userId, syncToken);
-          }
-          
-          resolve();
-        } else if (state === 'ERROR') {
-          cleanup();
-          reject(new Error('Sync error: ' + (data?.error?.message || 'Unknown error')));
+      const onSync = (state) => {
+        logger.debug('[Matrix Service] Matrix sync state:', {
+          state,
+          clientId: matrixClient.getUserId()
+        });
+
+        switch (state) {
+          case 'PREPARED':
+          case 'SYNCING':
+            cleanup();
+            resolve();
+            break;
+
+          case 'ERROR':
+            cleanup();
+            reject(new Error(`Matrix sync failed: state=${state}`));
+            break;
+
+          case 'RECONNECTING':
+            logger.info('[Matrix Service] Matrix client reconnecting');
+            break;
+
+          default:
+            logger.debug('[Matrix Service] Unhandled sync state:', { state });
         }
       };
 
-      // Set timeout with exponential backoff
-      const retryCount = options.retryCount || 0;
-      const backoff = Math.min(
-        SYNC_CONFIGS.BASE_BACKOFF * Math.pow(2, retryCount),
-        SYNC_CONFIGS.MAX_BACKOFF
-      );
+      matrixClient.on('sync', onSync);
 
-      timeoutId = setTimeout(() => {
+      // Check if already synced
+      if (matrixClient.isInitialSyncComplete()) {
+        logger.debug('[Matrix Service] Matrix client already synced');
         cleanup();
-        reject(new Error(`Sync timeout after ${timeout}ms`));
-      }, timeout + backoff);
-
-      // Check sync progress periodically
-      checkInterval = setInterval(() => {
-        const progress = client.getSyncProgress();
-        if (progress) {
-          this.updateSyncProgress(userId, {
-            state: 'syncing',
-            progress: Math.round(progress * 100)
-          });
-        }
-      }, 1000);
-
-      client.on('sync', onSync);
+        resolve();
+      }
     });
-  };
+  }
 
   handleSyncStateChange = (userId, state, prevState, data) => {
     try {
@@ -3256,6 +3194,65 @@ class MatrixWhatsAppService {
     } catch (error) {
       console.error('Error getting WhatsApp rooms:', error);
       throw error;
+    }
+  }
+
+  async emitSocketEvent(userId, event, data) {
+    try {
+      const io = getIO();
+      if (!io) {
+        logger.warn('[Matrix Service] Socket.IO not initialized');
+        return;
+      }
+
+      const socket = io.sockets.adapter.rooms.get(`user:${userId}`);
+      if (socket) {
+        // Socket is connected, emit immediately
+        io.to(`user:${userId}`).emit(event, data);
+      } else {
+        // Store for offline delivery
+        const offlineKey = `offline:${userId}:${event}`;
+        await pubClient.set(offlineKey, JSON.stringify({
+          event,
+          data,
+          timestamp: Date.now()
+        }), 'EX', 86400); // Store for 24 hours
+      }
+    } catch (error) {
+      logger.error('[Matrix Service] Error emitting socket event:', {
+        userId,
+        event,
+        error: error.message
+      });
+    }
+  }
+
+  async deliverOfflineEvents(userId) {
+    try {
+      const pattern = `offline:${userId}:*`;
+      const keys = await pubClient.keys(pattern);
+      
+      if (keys.length === 0) return;
+
+      const io = getIO();
+      if (!io) {
+        logger.warn('[Matrix Service] Socket.IO not initialized for offline delivery');
+        return;
+      }
+
+      for (const key of keys) {
+        const data = await pubClient.get(key);
+        if (data) {
+          const { event, data: eventData } = JSON.parse(data);
+          io.to(`user:${userId}`).emit(event, eventData);
+          await pubClient.del(key);
+        }
+      }
+    } catch (error) {
+      logger.error('[Matrix Service] Error delivering offline events:', {
+        userId,
+        error: error.message
+      });
     }
   }
 }

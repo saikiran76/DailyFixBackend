@@ -1,13 +1,14 @@
 import Redis from 'ioredis';
-import { logger } from './logger.js';
+import logger from '../utils/logger.js';
 
 const REDIS_CONFIG = {
   host: process.env.REDIS_HOST || 'localhost',
-  port: process.env.REDIS_PORT || 6379,
-  retryStrategy: (times) => {
-    const delay = Math.min(times * 50, 2000);
-    return delay;
-  }
+  port: parseInt(process.env.REDIS_PORT || '6379'),
+  password: process.env.REDIS_PASSWORD,
+  maxRetriesPerRequest: 3,
+  enableReadyCheck: true,
+  showFriendlyErrorStack: true,
+  lazyConnect: false
 };
 
 class RedisService {
@@ -15,115 +16,100 @@ class RedisService {
     this.client = null;
     this.pubClient = null;
     this.subClient = null;
-    this.isReady = false;
-    this.initPromise = this.connect();
+    this.isConnected = false;
+    this.connectionPromise = null;
   }
 
   async connect() {
+    if (this.connectionPromise) {
+      return this.connectionPromise;
+    }
+
+    this.connectionPromise = new Promise(async (resolve, reject) => {
     try {
+        logger.info('Redis service initialized with config:', { ...REDIS_CONFIG, password: '[REDACTED]', service: 'dailyfix-backend' });
+        
+        logger.info('Creating new Redis connection', { service: 'dailyfix-backend' });
+        
       // Create main client
       this.client = new Redis(REDIS_CONFIG);
       
-      // Create separate clients for pub/sub
+        // Create pub client
       this.pubClient = new Redis(REDIS_CONFIG);
+        
+        // Create sub client
       this.subClient = new Redis(REDIS_CONFIG);
 
-      // Set up event handlers
+        // Set up event handlers for main client
       this.client.on('connect', () => {
-        logger.info('Redis Client Connected');
-        this.isReady = true;
-      });
+          logger.info('Redis Client Connected', { service: 'dailyfix-backend' });
+        });
 
-      this.client.on('error', (err) => {
-        logger.error('Redis Client Error:', err);
-        this.isReady = false;
-      });
+        this.client.on('ready', () => {
+          logger.info('Redis Client Ready', { service: 'dailyfix-backend' });
+          this.isConnected = true;
+          resolve();
+        });
 
-      this.pubClient.on('connect', () => {
-        logger.info('Redis Pub Client Connected');
-      });
+        this.client.on('error', (error) => {
+          logger.error('Redis Client Error:', { error: error.message, service: 'dailyfix-backend' });
+          if (!this.isConnected) {
+            reject(error);
+          }
+        });
 
-      this.subClient.on('connect', () => {
-        logger.info('Redis Sub Client Connected');
-      });
-
-      // Wait for initial connection
-      await Promise.all([
-        new Promise(resolve => this.client.once('ready', resolve)),
-        new Promise(resolve => this.pubClient.once('ready', resolve)),
-        new Promise(resolve => this.subClient.once('ready', resolve))
-      ]);
-
-      logger.info('Redis clients connected successfully');
-    } catch (error) {
-      logger.error('Failed to connect Redis clients:', error);
-      throw error;
-    }
-  }
-
-  async ensureConnection() {
-    await this.initPromise;
-    if (!this.isReady) {
-      throw new Error('Redis client not ready');
-    }
-  }
-
-  async ping() {
-    await this.ensureConnection();
-    return this.client.ping();
-  }
-
-  async get(key) {
-    await this.ensureConnection();
-    return this.client.get(key);
-  }
-
-  async set(key, value, expiry = null) {
-    await this.ensureConnection();
-    if (expiry) {
-      return this.client.set(key, value, 'EX', expiry);
-    }
-    return this.client.set(key, value);
-  }
-
-  async del(key) {
-    await this.ensureConnection();
-    return this.client.del(key);
-  }
-
-  async publish(channel, message) {
-    await this.ensureConnection();
-    return this.pubClient.publish(channel, JSON.stringify(message));
-  }
-
-  subscribe(channel, callback) {
-    this.subClient.subscribe(channel);
-    this.subClient.on('message', (ch, message) => {
-      if (ch === channel) {
-        try {
-          callback(JSON.parse(message));
-        } catch (error) {
-          logger.error('Error processing Redis message:', error);
-        }
+      } catch (error) {
+        logger.error('Failed to initialize Redis:', { error: error.message, service: 'dailyfix-backend' });
+        reject(error);
       }
     });
+
+    return this.connectionPromise;
   }
 
   async disconnect() {
+    logger.info('Disconnecting Redis client', { service: 'dailyfix-backend' });
+    
+    if (this.client) {
+      await this.client.quit();
+    }
+    if (this.pubClient) {
+      await this.pubClient.quit();
+    }
+    if (this.subClient) {
+      await this.subClient.quit();
+    }
+    
+    this.isConnected = false;
+    this.connectionPromise = null;
+    logger.info('Redis client disconnected', { service: 'dailyfix-backend' });
+  }
+
+  getClient() {
+    return this.client;
+  }
+
+  getPubClient() {
+    return this.pubClient;
+  }
+
+  getSubClient() {
+    return this.subClient;
+  }
+
+  getConnectionStatus() {
+    return this.isConnected;
+  }
+
+  async ping() {
     try {
-      await Promise.all([
-        this.client?.disconnect(),
-        this.pubClient?.disconnect(),
-        this.subClient?.disconnect()
-      ]);
-      this.isReady = false;
-      logger.info('Redis clients disconnected');
+      const result = await this.client.ping();
+      return result === 'PONG';
     } catch (error) {
-      logger.error('Error disconnecting Redis clients:', error);
-      throw error;
+      logger.error('Redis ping failed:', { error: error.message, service: 'dailyfix-backend' });
+      return false;
     }
   }
 }
 
-export const redisClient = new RedisService();
-export default redisClient; 
+export const redisService = new RedisService(); 

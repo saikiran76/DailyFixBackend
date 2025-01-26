@@ -2,7 +2,7 @@ import { supabase } from '../utils/supabase.js';
 import { logger } from '../utils/logger.js';
 import { adminClient } from '../utils/supabase.js';
 import { matrixService } from './matrixService.js';
-import { redisClient } from '../utils/redis.js';
+import { redisService } from '../utils/redis.js';
 
 class TokenService {
   constructor() {
@@ -131,7 +131,7 @@ class TokenService {
 
   async _getSessionFromCache() {
     try {
-      const cachedData = await redisClient.get('session:token');
+      const cachedData = await redisService.get('session:token');
       if (!cachedData) return null;
 
       const session = JSON.parse(cachedData);
@@ -148,7 +148,7 @@ class TokenService {
 
   async _cacheSession(tokenData) {
     try {
-      await redisClient.set(
+      await redisService.set(
         'session:token',
         JSON.stringify(tokenData),
         'EX',

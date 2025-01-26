@@ -1,6 +1,6 @@
 import { supabase } from '../utils/supabase.js';
 import { bridges } from './matrixBridgeService.js';
-import { redisClient } from '../utils/redis.js';
+import { redisService } from '../utils/redis.js';
 import { tokenService } from './tokenService.js';
 import { logger } from '../utils/logger.js';
 import { databaseService } from './databaseService.js';
@@ -143,7 +143,7 @@ async function checkDatabaseHealth() {
 
 async function checkRedisHealth() {
   try {
-    const connected = await redisClient.ping();
+    const connected = await redisService.ping();
     return {
       connected,
       lastCheck: new Date().toISOString()

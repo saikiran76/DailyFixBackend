@@ -11,38 +11,42 @@ router.get('/onboarding-status', async (req, res) => {
     const userId = req.user.id;
     console.log('Fetching onboarding status for user:', userId);
     
-    // Get user's onboarding status from database
-    const { data: onboardingStatus, error: statusError } = await adminClient
-      .from('user_onboarding')
-      .select('*')
-      .eq('user_id', userId)
-      .single();
+    let onboardingStatus = null;
+    let accounts = [];
     
-    console.log("Current onboarding status:", onboardingStatus);
-    if (statusError && statusError.code !== 'PGRST116') { // Not found is okay
-      console.error('Error fetching onboarding status:', statusError);
-      throw statusError;
+    try {
+      // Get user's onboarding status from database
+      const { data, error: statusError } = await adminClient
+        .from('user_onboarding')
+        .select('*')
+        .eq('user_id', userId)
+        .single();
+      
+      if (!statusError || statusError.code === 'PGRST116') { // Not found is okay
+        onboardingStatus = data;
+      } else {
+        console.warn('Error fetching onboarding status:', statusError);
+      }
+
+      // Get all accounts with their credentials
+      const { data: accountsData, error: accountsError } = await adminClient
+        .from('accounts')
+        .select('platform, status, credentials')
+        .eq('user_id', userId);
+
+      if (!accountsError) {
+        accounts = accountsData || [];
+      } else {
+        console.warn('Error fetching accounts:', accountsError);
+      }
+    } catch (dbError) {
+      console.warn('Database operation failed:', dbError);
+      // Continue with default values
     }
 
-    // Get all accounts with their credentials
-    const { data: accounts, error: accountsError } = await adminClient
-      .from('accounts')
-      .select('platform, status, credentials')
-      .eq('user_id', userId);
-
-    if (accountsError) {
-      console.error('Error fetching accounts:', accountsError);
-      throw accountsError;
-    }
-
-    console.log("Found accounts:", accounts);
-
-    // Check platform connections
-    const matrixAccount = accounts?.find(a => a.platform === 'matrix');
-    const whatsappAccount = accounts?.find(a => a.platform === 'whatsapp');
-
-    console.log("Matrix account:", matrixAccount);
-    console.log("WhatsApp account:", whatsappAccount);
+    // Check platform connections - use safe defaults if data is missing
+    const matrixAccount = accounts.find(a => a.platform === 'matrix');
+    const whatsappAccount = accounts.find(a => a.platform === 'whatsapp');
 
     const matrixConnected = matrixAccount?.status === 'active';
     const whatsappConnected = whatsappAccount?.status === 'active' && 
@@ -58,34 +62,30 @@ router.get('/onboarding-status', async (req, res) => {
 
     // Get connected platforms
     const connectedPlatforms = accounts
-      ?.filter(account => {
+      .filter(account => {
         if (account.platform === 'whatsapp') {
           return account.status === 'active' && !!account.credentials?.bridge_room_id;
         }
         return account.status === 'active';
       })
-      .map(account => account.platform) || [];
+      .map(account => account.platform);
 
-    console.log("Connected platforms:", connectedPlatforms);
-
-    // If both are connected but onboarding isn't complete, update it
+    // Try to update onboarding status if needed
     if (matrixConnected && whatsappConnected && !onboardingStatus?.is_complete) {
-      console.log("Both platforms connected but onboarding not complete. Updating status...");
-      const { data: updateData, error: updateError } = await adminClient
-        .from('user_onboarding')
-        .upsert({
-          user_id: userId,
-          current_step: 'complete',
-          is_complete: true,
-          updated_at: new Date().toISOString()
-        }, {
-          onConflict: 'user_id'
-        });
-
-      if (updateError) {
-        console.error("Error updating onboarding status:", updateError);
-      } else {
-        console.log("Successfully updated onboarding status:", updateData);
+      try {
+        await adminClient
+          .from('user_onboarding')
+          .upsert({
+            user_id: userId,
+            current_step: 'complete',
+            is_complete: true,
+            updated_at: new Date().toISOString()
+          }, {
+            onConflict: 'user_id'
+          });
+      } catch (updateError) {
+        console.warn("Error updating onboarding status:", updateError);
+        // Continue without failing the request
       }
     }
 
@@ -94,23 +94,40 @@ router.get('/onboarding-status', async (req, res) => {
       currentStep: (matrixConnected && whatsappConnected) ? 'complete' : (onboardingStatus?.current_step || 'welcome'),
       matrixConnected,
       whatsappConnected,
-      connectedPlatforms
+      connectedPlatforms,
+      degraded: onboardingStatus === null // Indicate if we're working with incomplete data
     };
 
     console.log('Final onboarding status response:', response);
     res.json(response);
   } catch (error) {
     console.error('Error in onboarding status route:', error);
-    res.status(500).json({ error: 'Failed to fetch onboarding status' });
+    // Return a degraded but valid response
+    res.json({
+      isComplete: false,
+      currentStep: 'welcome',
+      matrixConnected: false,
+      whatsappConnected: false,
+      connectedPlatforms: [],
+      degraded: true,
+      error: 'Service temporarily degraded'
+    });
   }
 });
 
-// Update onboarding status (to match frontend's endpoint)
+// Update onboarding status
 router.post('/onboarding-status', async (req, res) => {
   try {
     const userId = req.user.id;
-    console.log('Updating onboarding status for user:', userId);
-    const { currentStep } = req.body;
+    const { currentStep, transactionId, previousStep, isRollback } = req.body;
+
+    console.log('Updating onboarding status:', {
+      userId,
+      currentStep,
+      transactionId,
+      previousStep,
+      isRollback
+    });
 
     // Validate step transition
     const validSteps = ['welcome', 'protocol_selection', 'matrix_setup', 'whatsapp_setup', 'complete'];
@@ -121,97 +138,126 @@ router.post('/onboarding-status', async (req, res) => {
       });
     }
 
-    // Get current status first
-    const { data: currentStatus, error: getError } = await adminClient
-      .from('user_onboarding')
-      .select('*')
-      .eq('user_id', userId)
-      .single();
+    // Start database transaction
+    const client = await adminClient.pool.connect();
+    
+    try {
+      await client.query('BEGIN');
 
-    if (getError && !getError.message.includes('not found')) {
-      console.error('Error fetching current status:', getError);
-      throw getError;
-    }
+      // Get current status first
+      const { data: currentStatus, error: getError } = await client.query(
+        'SELECT * FROM user_onboarding WHERE user_id = $1 FOR UPDATE',
+        [userId]
+      );
 
-    // For 'complete' step, verify required conditions are met
-    if (currentStep === 'complete') {
-      // Check Matrix account
-      const { data: matrixAccount, error: matrixError } = await adminClient
-        .from('accounts')
+      if (getError && !getError.message.includes('not found')) {
+        throw getError;
+      }
+
+      // For 'complete' step, verify required conditions are met
+      if (currentStep === 'complete' && !isRollback) {
+        // Check Matrix account
+        const { data: matrixAccount, error: matrixError } = await client.query(
+          'SELECT * FROM accounts WHERE user_id = $1 AND platform = $2',
+          [userId, 'matrix']
+        );
+
+        if (matrixError) throw matrixError;
+
+        // Check WhatsApp account
+        const { data: whatsappAccount, error: whatsappError } = await client.query(
+          'SELECT * FROM accounts WHERE user_id = $1 AND platform = $2',
+          [userId, 'whatsapp']
+        );
+
+        if (whatsappError) throw whatsappError;
+
+        // Verify both accounts exist and are active
+        const matrixConnected = matrixAccount?.status === 'active';
+        const whatsappConnected = whatsappAccount?.status === 'active' && 
+                                 !!whatsappAccount?.credentials?.bridge_room_id;
+
+        if (!matrixConnected || !whatsappConnected) {
+          await client.query('ROLLBACK');
+          return res.status(400).json({
+            status: 'error',
+            message: 'Cannot complete onboarding: Matrix and WhatsApp must be connected'
+          });
+        }
+      }
+
+      // If this is a rollback, restore previous state
+      if (isRollback) {
+        const { error: rollbackError } = await client.query(
+          'UPDATE user_onboarding SET current_step = $1, updated_at = NOW() WHERE user_id = $2',
+          [previousStep, userId]
+        );
+
+        if (rollbackError) throw rollbackError;
+      } else {
+        // Store transaction ID to prevent duplicates
+        if (transactionId) {
+          try {
+            await client.query(
+              'INSERT INTO onboarding_transactions (transaction_id, user_id, from_step, to_step) VALUES ($1, $2, $3, $4)',
+              [transactionId, userId, currentStatus?.current_step || 'initial', currentStep]
+            );
+          } catch (dupError) {
+            if (dupError.code === '23505') { // Unique violation
+              await client.query('ROLLBACK');
+              return res.status(409).json({
+                status: 'error',
+                message: 'Transaction already processed'
+              });
+            }
+            throw dupError;
+          }
+        }
+
+        // Update or insert onboarding status
+        const { error: updateError } = await client.query(
+          `INSERT INTO user_onboarding (user_id, current_step, is_complete, updated_at)
+           VALUES ($1, $2, $3, NOW())
+           ON CONFLICT (user_id) 
+           DO UPDATE SET current_step = $2, is_complete = $3, updated_at = NOW()`,
+          [userId, currentStep, currentStep === 'complete']
+        );
+
+        if (updateError) throw updateError;
+      }
+
+      // Commit transaction
+      await client.query('COMMIT');
+
+      // Get updated status
+      const { data: updatedStatus, error: getUpdatedError } = await adminClient
+        .from('user_onboarding')
         .select('*')
         .eq('user_id', userId)
-        .eq('platform', 'matrix')
         .single();
 
-      if (matrixError && !matrixError.message.includes('not found')) {
-        throw matrixError;
-      }
+      if (getUpdatedError) throw getUpdatedError;
 
-      // Check WhatsApp account
-      const { data: whatsappAccount, error: whatsappError } = await adminClient
-        .from('accounts')
-        .select('*')
-        .eq('user_id', userId)
-        .eq('platform', 'whatsapp')
-        .single();
-
-      if (whatsappError && !whatsappError.message.includes('not found')) {
-        throw whatsappError;
-      }
-
-      // Verify both accounts exist and are active
-      const matrixConnected = matrixAccount?.status === 'active';
-      const whatsappConnected = whatsappAccount?.status === 'active' && 
-                               !!whatsappAccount?.credentials?.bridge_room_id;
-
-      if (!matrixConnected || !whatsappConnected) {
-        return res.status(400).json({
-          status: 'error',
-          message: 'Cannot complete onboarding: Matrix and WhatsApp must be connected'
-        });
-      }
-    }
-
-    // Update or insert onboarding status
-    const { data: updateData, error: updateError } = await adminClient
-      .from('user_onboarding')
-      .upsert({
-        user_id: userId,
-        current_step: currentStep,
-        is_complete: currentStep === 'complete',
-        updated_at: new Date().toISOString()
-      }, {
-        onConflict: 'user_id',
-        returning: 'minimal'
+      console.log('Onboarding status updated successfully:', {
+        userId,
+        currentStep,
+        isComplete: currentStep === 'complete',
+        isRollback
       });
 
-    if (updateError) {
-      console.error('Error updating onboarding status:', updateError);
-      throw updateError;
+      res.json({
+        status: 'success',
+        data: updatedStatus
+      });
+
+    } catch (error) {
+      // Rollback transaction on error
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
     }
 
-    // Get updated status
-    const { data: updatedStatus, error: getUpdatedError } = await adminClient
-      .from('user_onboarding')
-      .select('*')
-      .eq('user_id', userId)
-      .single();
-
-    if (getUpdatedError) {
-      console.error('Error fetching updated status:', getUpdatedError);
-      throw getUpdatedError;
-    }
-
-    console.log('Onboarding status updated successfully:', {
-      userId,
-      currentStep,
-      isComplete: currentStep === 'complete'
-    });
-
-    res.json({
-      status: 'success',
-      data: updatedStatus
-    });
   } catch (error) {
     console.error('Error in onboarding status update:', error);
     res.status(500).json({

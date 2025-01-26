@@ -1,9 +1,11 @@
 import express from 'express';
 import { authenticateUser } from '../middleware/auth.js';
 import { whatsappEntityService } from '../services/whatsappEntityService.js';
+import { matrixWhatsAppService } from '../services/matrixWhatsAppService.js';
 import { validateRequest } from '../middleware/validation.js';
 import { adminClient } from '../utils/supabase.js';
-import logger from '../utils/logger.js';
+import { APIError } from '../middleware/errorHandler.js';
+import { logger } from '../utils/logger.js';
 
 const router = express.Router();
 
@@ -207,11 +209,22 @@ router.get('/contacts', async (req, res) => {
     const userId = req.user.id;
     console.log('[Contacts] Fetching contacts for user:', userId);
 
-    // Get contacts with built-in caching
-    const contacts = await whatsappEntityService.getContacts(userId, { forceSync: false });
+    // Get cached contacts first for immediate response
+    const cachedContacts = await whatsappEntityService.getCachedContacts(userId);
     
+    // Start background sync if needed
+    const lastSyncTime = await whatsappEntityService.getLastContactSyncTime(userId);
+    const SYNC_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes
+    
+    if (!lastSyncTime || Date.now() - lastSyncTime > SYNC_THRESHOLD_MS) {
+      console.log('[Contacts] Starting background sync for user:', userId);
+      whatsappEntityService.syncContacts(userId).catch(error => {
+        console.error('[Contacts] Background sync failed:', error);
+      });
+    }
+
     // Transform contacts for consistent response
-    const transformedContacts = (contacts || []).map(contact => {
+    const transformedContacts = (cachedContacts || []).map(contact => {
       // Extract priority-related fields from metadata if they exist
       const priorityInfo = contact.metadata?.priority_info || {};
       
@@ -230,16 +243,23 @@ router.get('/contacts', async (req, res) => {
       };
     });
 
-    res.json({
+    return res.json({
       status: 'success',
-      data: transformedContacts
+      data: transformedContacts,
+      meta: {
+        sync_info: {
+          last_sync: lastSyncTime,
+          is_syncing: lastSyncTime === null
+        }
+      }
     });
+
   } catch (error) {
     console.error('[Contacts] Error fetching contacts:', error);
-    res.status(500).json({
+    return res.status(500).json({
       status: 'error',
       message: 'Failed to fetch contacts',
-      error: error.message
+      details: error.message
     });
   }
 });
@@ -305,7 +325,7 @@ router.post('/contacts/:contactId/sync', validateRequest(['contactId']), async (
     }
 
     // Start new sync
-    console.log('[WhatsApp Sync Route] Initiating sync for contact:', contactId);
+    logger.info('[WhatsApp Sync Route] Initiating sync for contact:', contactId);
     const syncInfo = SyncManager.startSync(userId, parseInt(contactId));
 
     // Trigger sync in background
@@ -314,7 +334,12 @@ router.post('/contacts/:contactId/sync', validateRequest(['contactId']), async (
         SyncManager.completeSync(userId, parseInt(contactId), true);
       })
       .catch(error => {
-        console.error('[WhatsApp Sync Route] Sync failed:', error);
+        logger.error('[WhatsApp Sync Route] Sync failed:', {
+          error: error.message,
+          stack: error.stack,
+          userId,
+          contactId
+        });
         SyncManager.completeSync(userId, parseInt(contactId), false);
       });
 
@@ -330,10 +355,17 @@ router.post('/contacts/:contactId/sync', validateRequest(['contactId']), async (
     });
 
   } catch (error) {
-    console.error('[WhatsApp Sync Route] Error:', error);
-    res.status(500).json({
+    logger.error('[WhatsApp Sync Route] Error:', {
+      error: error.message,
+      stack: error.stack,
+      userId: req.user.id,
+      contactId: req.params.contactId
+    });
+    
+    return res.status(500).json({
       status: 'error',
-      message: error.message || 'Failed to start sync'
+      message: 'Failed to start sync',
+      details: error.message
     });
   }
 });
@@ -344,10 +376,10 @@ router.get('/contacts/:contactId/messages', validateRequest(['contactId']), asyn
     const userId = req.user.id;
     const { contactId } = req.params;
     const { page = 1, limit = 50 } = req.query;
-    
-    console.log('[Messages] Fetching messages:', { userId, contactId, page, limit });
 
-    // Get cached messages first
+    logger.info('[Messages] Fetching messages:', { userId, contactId, page, limit });
+
+    // Get messages with pagination
     const messages = await whatsappEntityService.getMessages(userId, contactId, {
       page: parseInt(page),
       limit: parseInt(limit)
@@ -358,10 +390,10 @@ router.get('/contacts/:contactId/messages', validateRequest(['contactId']), asyn
 
     // If no messages and no sync in progress, trigger a sync
     if (messages.length === 0 && (!syncInfo || syncInfo.status === 'idle')) {
-      console.log('[Messages] No messages found, triggering sync');
+      logger.info('[Messages] No messages found, triggering sync');
       try {
         const syncResult = await matrixWhatsAppService.syncMessages(userId, contactId);
-        console.log('[Messages] Sync triggered:', syncResult);
+        logger.info('[Messages] Sync triggered:', syncResult);
         
         // Get messages again after sync
         const updatedMessages = await whatsappEntityService.getMessages(userId, contactId, {
@@ -395,7 +427,12 @@ router.get('/contacts/:contactId/messages', validateRequest(['contactId']), asyn
           }
         });
       } catch (syncError) {
-        console.error('[Messages] Sync error:', syncError);
+        logger.error('[Messages] Sync error:', {
+          error: syncError.message,
+          stack: syncError.stack,
+          userId,
+          contactId
+        });
       }
     }
 
@@ -433,11 +470,20 @@ router.get('/contacts/:contactId/messages', validateRequest(['contactId']), asyn
     });
 
   } catch (error) {
-    console.error('[Messages] Error fetching messages:', error);
+    logger.error('[Messages] Error fetching messages:', {
+      error: error.message,
+      stack: error.stack,
+      userId: req.user.id,
+      contactId: req.params.contactId,
+      page: req.query.page,
+      limit: req.query.limit
+    });
+
     return res.status(500).json({
       status: 'error',
       message: 'Failed to fetch messages',
-      details: error.message
+      details: error.message,
+      sync_info: { status: 'error' }
     });
   }
 });

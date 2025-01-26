@@ -59,10 +59,10 @@ export const requestHandler = async (req, res, next) => {
     const dbHealth = await databaseService.healthCheck();
     if (!dbHealth.healthy) {
       logger.error('Database health check failed:', dbHealth.error);
-      return res.status(503).json({
-        error: 'Service temporarily unavailable',
-        details: 'Database connection issues'
-      });
+      // return res.status(503).json({
+      //   error: 'Service temporarily unavailable',
+      //   details: 'Database connection issues'
+      // });
     }
 
     // Intercept response to track metrics

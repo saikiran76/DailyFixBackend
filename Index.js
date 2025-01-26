@@ -14,15 +14,12 @@ import logger from './utils/logger.js';
 
 // Import configuration
 import { config } from './config/config.js';
-import { redisClient } from './services/redisService.js';
+import { redisService } from './utils/redis.js';
 
 // Import core services
 import { databaseService } from './services/databaseService.js';
 import { rateLimiterService } from './services/rateLimiterService.js';
-import { initializeSocketServer } from './services/socketService.js';
-import { setIO } from './utils/socket.js';
-
-// Import initialization services
+import { initializeSocketServer } from './utils/socket.js';
 import { initializeMatrixClient } from './services/matrixService.js';
 import { initializePlatformBridge, bridges } from './services/matrixBridgeService.js';
 import { checkSystemHealth } from './services/healthCheck.js';
@@ -86,6 +83,9 @@ process.on('uncaughtException', (error) => {
 const app = express();
 const server = http.createServer(app);
 
+// Initialize Socket.IO
+initializeSocketServer(server);
+
 // Apply security middleware
 app.use(helmet());
 app.use(compression());
@@ -109,15 +109,30 @@ async function initializeServices() {
     logger.info('Initializing core services...');
 
     // Initialize Redis first (if not already connected)
-    if (!redisClient.getConnectionStatus()) {
-      await redisClient.connect();
+    if (!redisService.getConnectionStatus()) {
+      await redisService.connect();
       logger.info('Redis service initialized');
+    }
+
+    // Initialize Socket.IO before other services
+    try {
+      socketServer = await initializeSocketServer(server);
+      if (!socketServer) {
+        throw new Error('Socket server initialization returned null');
+      }
+      logger.info('Socket service initialized successfully');
+    } catch (socketError) {
+      logger.error('Failed to initialize socket server:', {
+        error: socketError.message,
+        stack: socketError.stack
+      });
+      throw socketError;
     }
 
     // Configure session with Redis
     app.use(session({
       store: new RedisStore({ 
-        client: redisClient.client,
+        client: redisService.client,
         prefix: 'sess:'
       }),
       secret: process.env.SESSION_SECRET || 'your-secret-key',
@@ -137,21 +152,6 @@ async function initializeServices() {
     logger.info('Token service initialized:', { 
       hasActiveSession: !!tokenService.activeSession 
     });
-
-    // Initialize socket service
-    try {
-      socketServer = await initializeSocketServer(server);
-      if (!socketServer) {
-        throw new Error('Socket server initialization returned null');
-      }
-      logger.info('Socket service initialized successfully');
-    } catch (socketError) {
-      logger.error('Failed to initialize socket server:', {
-        error: socketError.message,
-        stack: socketError.stack
-      });
-      throw socketError;
-    }
 
     // Start server
     await new Promise((resolve, reject) => {
@@ -208,7 +208,7 @@ async function cleanup() {
     
     // Disconnect Redis clients last
     try {
-      await redisClient.disconnect();
+      await redisService.disconnect();
       logger.info('Redis clients disconnected successfully');
     } catch (redisError) {
       logger.error('Error disconnecting Redis clients:', {
@@ -233,39 +233,31 @@ app.use(requestHandler);
 // Health check endpoint
 app.get('/health', async (req, res) => {
   try {
-    const dbHealth = await databaseService.healthCheck();
-    const status = {
-      service: 'dailyfix-backend',
-      status: 'healthy',
-      timestamp: new Date().toISOString(),
-      redis: {
-        connected: await redisClient.ping(),
-        lastCheck: new Date().toISOString()
-      },
-      database: {
-        connected: dbHealth.healthy,
-        lastCheck: new Date().toISOString(),
-        poolStats: {
-          size: dbHealth.poolSize,
-          waiting: dbHealth.waiting,
-          idle: dbHealth.idle
+    // Check database health
+    const dbStatus = await databaseService.getPoolStatus();
+    const redisStatus = redisService.getConnectionStatus();
+
+    const health = {
+      status: 'ok',
+      timestamp: new Date(),
+      services: {
+        database: {
+          status: dbStatus.totalConnections > 0 ? 'up' : 'down',
+          metrics: dbStatus
+        },
+        redis: {
+          status: redisStatus ? 'up' : 'down'
         }
-      },
-      tokenService: {
-        valid: tokenService.initialized,
-        status: tokenService.initialized ? 'ready' : 'initializing',
-        lastCheck: new Date().toISOString()
-      },
-      bridges: {}
+      }
     };
 
-    res.json(status);
+    res.json(health);
   } catch (error) {
     logger.error('Health check failed:', error);
-    res.status(500).json({
+    res.status(503).json({
       status: 'error',
-      message: 'Health check failed',
-      timestamp: new Date().toISOString()
+      timestamp: new Date(),
+      error: error.message
     });
   }
 });

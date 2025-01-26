@@ -8,7 +8,7 @@ import { whatsappEntityService } from '../services/whatsappEntityService.js';
 import { redisConfig, healthCheck, socketConfig } from '../config/redis.js';
 import { logger } from '../utils/logger.js';
 import { tokenService } from './tokenService.js';
-import { redisClient } from './redisService.js';
+import { redisService } from '../utils/redis.js';
 import CircuitBreaker from 'opossum';
 import { setupWhatsAppHandlers } from '../socket/whatsappHandler.js';
 
@@ -41,7 +41,8 @@ const CIRCUIT_BREAKER_OPTIONS = {
 
 // Enhanced metrics tracking
 const enhancedMetrics = {
-  ...metrics,
+  events: new Map(),
+  errors: new Map(),
   circuitBreakers: new Map(),
   resourceUsage: {
     memory: new Map(),
@@ -62,30 +63,34 @@ const calculateAverageLatency = () => {
 
 // Track event metrics
 const trackEvent = (event, latency = 0) => {
-  metrics.events.set(event, (metrics.events.get(event) || 0) + 1);
-  metrics.latency.set(event, (metrics.latency.get(event) || 0) + latency);
+  enhancedMetrics.events.set(event, (enhancedMetrics.events.get(event) || 0) + 1);
+  if (latency > 0) {
+    enhancedMetrics.performance.responseTime.set(event, latency);
+  }
 };
 
 // Track error metrics
 const trackError = (error) => {
   const errorType = error.type || 'unknown';
-  metrics.errors.set(errorType, (metrics.errors.get(errorType) || 0) + 1);
+  enhancedMetrics.errors.set(errorType, (enhancedMetrics.errors.get(errorType) || 0) + 1);
 };
 
 // Enhanced error tracking with context
 const enhancedTrackError = (error, context = {}) => {
   const errorType = error.type || 'unknown';
-  metrics.errors.set(errorType, (metrics.errors.get(errorType) || 0) + 1);
+  enhancedMetrics.errors.set(errorType, (enhancedMetrics.errors.get(errorType) || 0) + 1);
   logger.error(`Socket error: ${error.message}`, { ...context, errorType });
 };
 
 // Enhanced event tracking with retry information
 const enhancedTrackEvent = (event, latency = 0, retryCount = 0) => {
-  metrics.events.set(event, (metrics.events.get(event) || 0) + 1);
-  metrics.latency.set(event, (metrics.latency.get(event) || 0) + latency);
+  enhancedMetrics.events.set(event, (enhancedMetrics.events.get(event) || 0) + 1);
+  if (latency > 0) {
+    enhancedMetrics.performance.responseTime.set(event, latency);
+  }
   if (retryCount > 0) {
-    metrics.retries = metrics.retries || new Map();
-    metrics.retries.set(event, (metrics.retries.get(event) || 0) + 1);
+    enhancedMetrics.retries = enhancedMetrics.retries || new Map();
+    enhancedMetrics.retries.set(event, (enhancedMetrics.retries.get(event) || 0) + 1);
   }
 };
 
@@ -126,6 +131,20 @@ const monitorResources = () => {
   }
 };
 
+// Helper to safely convert Map to object
+const safeMapToObject = (map) => {
+  if (!(map instanceof Map)) {
+    logger.warn('Expected Map but got:', { type: typeof map, value: map });
+    return {};
+  }
+  try {
+    return Object.fromEntries(map);
+  } catch (error) {
+    logger.error('Error converting Map to object:', error);
+    return {};
+  }
+};
+
 class SocketService {
   constructor() {
     this.io = null;
@@ -154,16 +173,23 @@ class SocketService {
         }
       });
 
-      // Set up Redis adapter
-      this.io.adapter(createAdapter(redisClient.pubClient, redisClient.subClient));
+      // Get Redis pub/sub clients
+      const pubClient = redisService.getPubClient();
+      const subClient = redisService.getSubClient();
+      
+      // Create Redis adapter
+      const redisAdapter = createAdapter(pubClient, subClient);
+      
+      // Set up Socket.IO with Redis adapter
+      this.io.adapter(redisAdapter);
 
       // Enhanced Redis error handling
-      redisClient.pubClient.on('error', (err) => {
-        logger.error('Redis Pub Client Error:', {
-          error: err,
-          stack: err?.stack,
-          timestamp: new Date().toISOString()
-        });
+      redisService.pubClient.on('error', (err) => {
+      logger.error('Redis Pub Client Error:', {
+        error: err,
+        stack: err?.stack,
+        timestamp: new Date().toISOString()
+      });
         enhancedTrackError(err, { type: 'redis_pub' });
       });
 
@@ -230,8 +256,8 @@ class SocketService {
         logger.info('[Socket] New connection established:', {
           socketId: socket.id,
           userId: socket.userId
-        });
       });
+    });
 
       this.initialized = true;
       logger.info('[Socket] Socket service initialized successfully');
@@ -255,24 +281,50 @@ class SocketService {
     setInterval(async () => {
       try {
         const timestamp = Date.now();
+        
+        // Safely collect metrics
+        const eventCounts = safeMapToObject(enhancedMetrics.events);
+        const errorCounts = safeMapToObject(enhancedMetrics.errors);
+        const responseTime = safeMapToObject(enhancedMetrics.performance.responseTime);
+        const throughput = safeMapToObject(enhancedMetrics.performance.throughput);
+        const memory = safeMapToObject(enhancedMetrics.resourceUsage.memory);
+        const cpu = safeMapToObject(enhancedMetrics.resourceUsage.cpu);
+
         const metricsData = {
-          activeConnections: this.connections.size,
-          eventCounts: Object.fromEntries(enhancedMetrics.events),
-          errorCounts: Object.fromEntries(enhancedMetrics.errors),
+          eventCounts,
+          errorCounts,
           performance: {
-            responseTime: Object.fromEntries(enhancedMetrics.performance.responseTime),
-            throughput: Object.fromEntries(enhancedMetrics.performance.throughput)
+            responseTime,
+            throughput
           },
           resourceUsage: {
-            memory: Object.fromEntries(enhancedMetrics.resourceUsage.memory),
-            cpu: Object.fromEntries(enhancedMetrics.resourceUsage.cpu)
+            memory,
+            cpu
           },
           timestamp
         };
 
-        await redisClient.publish('socket:metrics', JSON.stringify(metricsData));
+        logger.debug('Collecting metrics:', metricsData);
+        
+        // Get Redis pub client and publish metrics
+        const pubClient = redisService.getPubClient();
+        if (!pubClient) {
+          throw new Error('Redis pub client not available');
+        }
+        await pubClient.publish('socket:metrics', JSON.stringify(metricsData));
       } catch (error) {
-        logger.error('Error collecting metrics:', error);
+        logger.error('Error collecting metrics:', {
+          error: error.message,
+          stack: error.stack,
+          metrics: {
+            events: enhancedMetrics.events?.size,
+            errors: enhancedMetrics.errors?.size,
+            responseTime: enhancedMetrics.performance?.responseTime?.size,
+            throughput: enhancedMetrics.performance?.throughput?.size,
+            memory: enhancedMetrics.resourceUsage?.memory?.size,
+            cpu: enhancedMetrics.resourceUsage?.cpu?.size
+          }
+        });
       }
     }, 30000);
   }
@@ -335,14 +387,14 @@ class SocketService {
       this.updateLastActivity(socket);
     });
 
-    // Handle errors
-    socket.on('error', (error) => {
+        // Handle errors
+        socket.on('error', (error) => {
       logger.error('[Socket] Client error:', {
         userId: socket.userId,
         socketId: socket.id,
         error: error.message
-      });
-    });
+          });
+        });
 
     // Handle reconnection
     socket.on('reconnect_attempt', (attempt) => {
@@ -365,7 +417,7 @@ class SocketService {
 
   updateLastActivity(socket) {
     const key = `socket:activity:${socket.id}`;
-    redisClient.pubClient.set(key, Date.now(), 'EX', 300); // Store for 5 minutes
+    redisService.pubClient.set(key, Date.now(), 'EX', 300); // Store for 5 minutes
   }
 }
 

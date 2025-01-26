@@ -1,6 +1,6 @@
 import { adminClient } from '../utils/supabase.js';
 import { logger } from '../utils/logger.js';
-import { redisClient } from './redisService.js';
+import { redisService } from '../utils/redis.js';
 import { whatsappEntityService } from './whatsappEntityService.js';
 
 const PRIORITY_PATTERNS = {

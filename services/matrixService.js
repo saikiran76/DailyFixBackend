@@ -2,7 +2,7 @@ import sdk from 'matrix-js-sdk';
 import { adminClient } from '../utils/supabase.js';
 import { logger } from '../utils/logger.js';
 import { BRIDGE_CONFIGS, BRIDGE_TIMEOUTS } from '../config/bridgeConfig.js';
-import { redisClient } from './redisService.js';
+import { redisService } from '../utils/redis.js';
 
 // Add the old function signature that uses the new implementation
 export async function initializeMatrixClient(accessToken, userId) {
